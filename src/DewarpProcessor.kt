@@ -39,6 +39,12 @@ class DewarpProcessor(
         // 2. Skeletonize (Thinning)
         val skeleton = skeletonize(binary)
 
+        bridgeSkeletonGaps(skeleton)
+
+        // This specifically "heals" horizontal breaks of up to 4 pixels
+        val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 1.0))
+        Imgproc.morphologyEx(skeleton, skeleton, Imgproc.MORPH_CLOSE, kernel)
+
         val linePoints = extractSplineControlPoints(skeleton)
         val splicedLinePoints = spliceLineFragments(linePoints)
 
@@ -125,6 +131,50 @@ class DewarpProcessor(
             if (Core.countNonZero(res) == 0) done = true
         }
         return skel
+    }
+
+    fun bridgeSkeletonGaps(skeleton: Mat, maxGap: Double = 5.0) {
+        val terminalPoints = mutableListOf<Point>()
+        val rows = skeleton.rows()
+        val cols = skeleton.cols()
+
+        // 1. Find all terminal pixels (end of a line)
+        // A terminal pixel in a skeleton has exactly one 8-neighbor
+        for (y in 1 until rows - 1) {
+            for (x in 1 until cols - 1) {
+                if (skeleton.get(y, x)[0] > 0) {
+                    if (countNeighbors(skeleton, x, y) == 1) {
+                        terminalPoints.add(Point(x.toDouble(), y.toDouble()))
+                    }
+                }
+            }
+        }
+
+        // 2. Connect near-neighbors
+        for (i in 0 until terminalPoints.size) {
+            for (j in i + 1 until terminalPoints.size) {
+                val p1 = terminalPoints[i]
+                val p2 = terminalPoints[j]
+
+                val dist = Math.sqrt(Math.pow(p1.x - p2.x, 2.0) + Math.pow(p1.y - p2.y, 2.0))
+
+                if (dist > 0 && dist <= maxGap) {
+                    // Draw a 1px bridge to "heal" the skeleton
+                    Imgproc.line(skeleton, p1, p2, Scalar(255.0), 1)
+                }
+            }
+        }
+    }
+
+    private fun countNeighbors(mat: Mat, x: Int, y: Int): Int {
+        var count = 0
+        for (dy in -1..1) {
+            for (dx in -1..1) {
+                if (dx == 0 && dy == 0) continue
+                if (mat.get(y + dy, x + dx)[0] > 0) count++
+            }
+        }
+        return count
     }
 
     /**
