@@ -4,12 +4,13 @@ import android.graphics.Bitmap
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.imgproc.Imgproc
-import androidx.core.graphics.createBitmap
 import org.opencv.core.Core
 import org.opencv.core.Point
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import android.util.Log
+import kotlin.math.pow
+import kotlin.math.abs
 
 class DewarpProcessor(
     private val dbNetModel: DBNetModel
@@ -31,7 +32,11 @@ class DewarpProcessor(
      * Processes the input bitmap to flatten the page using YOLO segmentation.
      */
     fun process(original: Bitmap): Bitmap {
+
         val totalStart = System.currentTimeMillis()
+        val width = original.width
+        val height = original.height
+
         Log.d(TAG, "========== Starting Dewarp Pipeline ==========")
         Log.d(TAG, "Input size: ${original.width}x${original.height}")
 
@@ -39,7 +44,22 @@ class DewarpProcessor(
         var stageStart = System.currentTimeMillis()
         val probMask = dbNetModel.getHeatmap(original)
         var stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[1/8] DBNet Heatmap: ${stageDuration}ms")
+        Log.d(TAG, "[1/8] DBNet Heatmap: ${stageDuration}ms (size: ${probMask.width()}x${probMask.height()})")
+
+        // DIAGNOSTIC: Check heatmap values
+        val heatmapStats = Core.minMaxLoc(probMask)
+        Log.d(TAG, "DIAGNOSTIC: Heatmap range [${heatmapStats.minVal}, ${heatmapStats.maxVal}]")
+        val nonZeroHeatmap = Core.countNonZero(probMask)
+        Log.d(TAG, "DIAGNOSTIC: Non-zero heatmap pixels: $nonZeroHeatmap / ${probMask.total()}")
+
+        // Normalize coordinates - resize heatmap to match original dimensions
+        stageStart = System.currentTimeMillis()
+        if (probMask.width() != width || probMask.height() != height) {
+            Log.d(TAG, "Resizing heatmap from ${probMask.width()}x${probMask.height()} to ${width}x${height}")
+            Imgproc.resize(probMask, probMask, Size(width.toDouble(), height.toDouble()))
+        }
+        stageDuration = System.currentTimeMillis() - stageStart
+        Log.d(TAG, "[1b/8] Heatmap Resize: ${stageDuration}ms")
 
         // Stage 2: Thresholding to Binary
         stageStart = System.currentTimeMillis()
@@ -47,13 +67,28 @@ class DewarpProcessor(
         Imgproc.threshold(probMask, binary, 0.3, 255.0, Imgproc.THRESH_BINARY)
         binary.convertTo(binary, CvType.CV_8UC1)
         stageDuration = System.currentTimeMillis() - stageStart
+
+        // DIAGNOSTIC: Check binary mask
+        val nonZeroBinary = Core.countNonZero(binary)
+        val binaryPercent = (nonZeroBinary.toFloat() / binary.total()) * 100
         Log.d(TAG, "[2/8] Thresholding: ${stageDuration}ms")
+        Log.d(TAG, "DIAGNOSTIC: Binary pixels: $nonZeroBinary (${String.format("%.2f", binaryPercent)}% of image)")
+
+        if (nonZeroBinary == 0) {
+            Log.e(TAG, "ERROR: Binary mask is completely empty! DBNet found no text or threshold too high.")
+            probMask.release()
+            binary.release()
+            return original
+        }
 
         // Stage 3: Skeletonization
         stageStart = System.currentTimeMillis()
         val skeleton = skeletonize(binary)
         stageDuration = System.currentTimeMillis() - stageStart
         Log.d(TAG, "[3/8] Skeletonization: ${stageDuration}ms")
+
+        val nonZeroSkeleton = Core.countNonZero(skeleton)
+        Log.d(TAG, "DIAGNOSTIC: Skeleton pixels: $nonZeroSkeleton")
 
         // Stage 4: Bridge Gaps - OPTIMIZED
         stageStart = System.currentTimeMillis()
@@ -72,56 +107,98 @@ class DewarpProcessor(
         stageStart = System.currentTimeMillis()
         val linePoints = extractSplineControlPointsOptimized(skeleton)
         stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[6/8] Extract Control Points (Optimized): ${stageDuration}ms (${linePoints.size} fragments)")
+        Log.d(TAG, "[6/8] Extract Control Points: ${stageDuration}ms (${linePoints.size} lines)")
 
-        // Stage 7: Splice Fragments
-        stageStart = System.currentTimeMillis()
-        val splicedLinePoints = spliceLineFragments(linePoints)
-        stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[7/8] Splice Fragments: ${stageDuration}ms (${linePoints.size} -> ${splicedLinePoints.size} lines)")
+        // DIAGNOSTIC: Show sample line points
+        if (linePoints.isNotEmpty()) {
+            val firstLine = linePoints[0]
+            Log.d(TAG, "DIAGNOSTIC: First line has ${firstLine.size} points")
+            if (firstLine.size >= 2) {
+                Log.d(TAG, "  Start: (${firstLine[0].x}, ${firstLine[0].y})")
+                Log.d(TAG, "  End: (${firstLine.last().x}, ${firstLine.last().y})")
+            }
+        }
 
-        // Stage 8: Draw Result
+        if (linePoints.isEmpty()) {
+            Log.e(TAG, "No control points found! Check DBNet output or Thresholding.")
+            Log.d(TAG, "========== Pipeline Aborted (No Data) ==========")
+            probMask.release()
+            binary.release()
+            skeleton.release()
+            return original
+        }
+
+        // Stage 7: Generate Dewarp Maps (Vector Field Approach)
         stageStart = System.currentTimeMillis()
-        val splicedLines = drawSplicedLines(skeleton, splicedLinePoints)
-        val resultBitmap = createBitmap(splicedLines.cols(), splicedLines.rows())
-        org.opencv.android.Utils.matToBitmap(splicedLines, resultBitmap)
+        val (mapX, mapY) = generateDewarpMaps(linePoints, width, height)
         stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[8/8] Draw & Convert: ${stageDuration}ms")
+        Log.d(TAG, "[7/8] Field Map Generation: ${stageDuration}ms")
+
+        // DIAGNOSTIC: Check map statistics
+        val mapYStats = Core.minMaxLoc(mapY)
+        val mapXStats = Core.minMaxLoc(mapX)
+        Log.d(TAG, "DIAGNOSTIC: MapY range [${mapYStats.minVal}, ${mapYStats.maxVal}]")
+        Log.d(TAG, "DIAGNOSTIC: MapX range [${mapXStats.minVal}, ${mapXStats.maxVal}]")
+
+        // Check for identity mapping
+        var isIdentity = true
+        val sampleSize = 100
+        for (i in 0 until sampleSize) {
+            val row = (height * i) / sampleSize
+            val col = (width * i) / sampleSize
+            val expectedY = row.toDouble()
+            val actualY = mapY.get(row, col)[0]
+            if (abs(actualY - expectedY) > 0.1) {
+                isIdentity = false
+                break
+            }
+        }
+        if (isIdentity) {
+            Log.w(TAG, "WARNING: Dewarp map appears to be identity mapping! No correction will occur.")
+        }
+
+        // Stage 8: Remap (Apply the Warp)
+        stageStart = System.currentTimeMillis()
+
+        // Convert original Bitmap to Mat
+        val sourceMat = Mat()
+        org.opencv.android.Utils.bitmapToMat(original, sourceMat)
+        val destinationMat = Mat(height, width, sourceMat.type())
+
+        // Perform the actual dewarp
+        Imgproc.remap(sourceMat, destinationMat, mapX, mapY, Imgproc.INTER_LINEAR)
+
+        // Convert back to Bitmap
+        val resultBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        org.opencv.android.Utils.matToBitmap(destinationMat, resultBitmap)
+
+        stageDuration = System.currentTimeMillis() - stageStart
+        Log.d(TAG, "[8/8] Remap & Convert: ${stageDuration}ms")
 
         // Cleanup
-        listOf(splicedLines, probMask, binary, skeleton).forEach { it.release() }
+        listOf(sourceMat, destinationMat, mapX, mapY, probMask, binary, skeleton).forEach { it.release() }
 
-        val totalDuration = System.currentTimeMillis() - totalStart
-        Log.d(TAG, "========== Pipeline Complete: ${totalDuration}ms ==========")
-
+        Log.d(TAG, "========== Pipeline Complete: ${System.currentTimeMillis() - totalStart}ms ==========")
         return resultBitmap
     }
 
-    /**
-     * OPTIMIZED: Uses Connected Components to find terminals + downsampling
-     */
     fun bridgeSkeletonGapsOptimized(skeleton: Mat, maxGap: Double = 5.0) {
         val start = System.currentTimeMillis()
 
-        // Downsample for faster terminal detection (4x smaller = 16x fewer pixels)
         val downscaleFactor = 4.0
         val small = Mat()
         Imgproc.resize(skeleton, small, Size(), 1.0/downscaleFactor, 1.0/downscaleFactor, Imgproc.INTER_NEAREST)
 
-        // Run Connected Components on downsampled image
         val labeled = Mat()
         val stats = Mat()
         val centroids = Mat()
-        val findStart = System.currentTimeMillis()
         val numLabels = Imgproc.connectedComponentsWithStats(small, labeled, stats, centroids)
 
-        // Convert to array for fast access
         val rows = labeled.rows()
         val cols = labeled.cols()
         val labelData = IntArray(rows * cols)
         labeled.get(0, 0, labelData)
 
-        // Spatial hash for terminals
         val cellSize = ((maxGap / downscaleFactor) * 2).toInt().coerceAtLeast(2)
         val gridCols = (cols + cellSize - 1) / cellSize
         val spatialGrid = HashMap<Int, MutableList<Point>>()
@@ -132,12 +209,10 @@ class DewarpProcessor(
             return gy * gridCols + gx
         }
 
-        // Find terminal points using CC-based approach
         var terminalCount = 0
         for (label in 1 until numLabels) {
             val componentPixels = mutableListOf<Point>()
 
-            // Collect all pixels in this component
             for (y in 0 until rows) {
                 for (x in 0 until cols) {
                     if (labelData[y * cols + x] == label) {
@@ -146,7 +221,6 @@ class DewarpProcessor(
                 }
             }
 
-            // For each pixel, check if it's a terminal (1 neighbor in same component)
             for (p in componentPixels) {
                 val x = p.x.toInt()
                 val y = p.y.toInt()
@@ -166,7 +240,6 @@ class DewarpProcessor(
                 }
 
                 if (neighborCount == 1) {
-                    // Scale back to full resolution
                     val fullResPoint = Point(p.x * downscaleFactor, p.y * downscaleFactor)
                     val key = getGridKey(x, y)
                     spatialGrid.getOrPut(key) { mutableListOf() }.add(fullResPoint)
@@ -175,11 +248,8 @@ class DewarpProcessor(
             }
         }
 
-        val findDuration = System.currentTimeMillis() - findStart
-        Log.v(TAG, "  Found $terminalCount terminal points (${findDuration}ms, downsampled ${downscaleFactor}x)")
+        Log.v(TAG, "  Found $terminalCount terminal points")
 
-        // Connect near-neighbors using spatial hash
-        val connectStart = System.currentTimeMillis()
         var bridgeCount = 0
 
         spatialGrid.forEach { (key, points) ->
@@ -214,10 +284,8 @@ class DewarpProcessor(
             }
         }
 
-        val connectDuration = System.currentTimeMillis() - connectStart
-        Log.v(TAG, "  Created $bridgeCount bridges (${connectDuration}ms)")
+        Log.v(TAG, "  Created $bridgeCount bridges")
 
-        // Cleanup
         small.release()
         labeled.release()
         stats.release()
@@ -227,16 +295,203 @@ class DewarpProcessor(
         Log.v(TAG, "  Bridge total: ${totalDuration}ms")
     }
 
-    /**
-     * OPTIMIZED: Direct pixel access instead of repeated Mat.get() calls
-     */
+    fun generateDewarpMaps(allLines: List<List<Point>>, width: Int, height: Int): Pair<Mat, Mat> {
+        val samples = buildSlopeSamples(allLines)
+
+        if (samples.isEmpty()) {
+            Log.w(TAG, "No slope samples - returning identity mapping")
+            val mapX = Mat(height, width, CvType.CV_32FC1)
+            val mapY = Mat(height, width, CvType.CV_32FC1)
+            val xData = FloatArray(width * height)
+            val yData = FloatArray(width * height)
+            for (row in 0 until height) {
+                for (col in 0 until width) {
+                    val idx = row * width + col
+                    xData[idx] = col.toFloat()
+                    yData[idx] = row.toFloat()
+                }
+            }
+            mapX.put(0, 0, xData)
+            mapY.put(0, 0, yData)
+            return mapX to mapY
+        }
+
+        // DIAGNOSTIC: Analyze slope distribution
+        val slopes = samples.map { it.slope }
+        val avgSlope = slopes.average()
+        val maxSlope = slopes.maxOrNull() ?: 0f
+        val minSlope = slopes.minOrNull() ?: 0f
+        val slopesNearZero = slopes.count { abs(it) < 0.01f }
+
+        Log.d(TAG, "DIAGNOSTIC: Slope statistics:")
+        Log.d(TAG, "  Samples: ${samples.size}")
+        Log.d(TAG, "  Avg slope: ${String.format("%.4f", avgSlope)}")
+        Log.d(TAG, "  Range: [${String.format("%.4f", minSlope)}, ${String.format("%.4f", maxSlope)}]")
+        Log.d(TAG, "  Near-zero slopes: $slopesNearZero / ${samples.size}")
+
+        if (abs(avgSlope) < 0.001 && abs(maxSlope) < 0.01 && abs(minSlope) < 0.01) {
+            Log.w(TAG, "WARNING: All detected slopes are near-zero! Text appears already straight.")
+            Log.w(TAG, "  This will produce identity mapping. Check if image actually needs dewarping.")
+        }
+
+        Log.d(TAG, "Building slope grid with ${samples.size} samples")
+        val slopeGrid = SlopeGrid(samples, width, height)
+
+        val mapX = Mat(height, width, CvType.CV_32FC1)
+        val mapY = Mat(height, width, CvType.CV_32FC1)
+
+        val xData = FloatArray(width * height)
+        val yData = FloatArray(width * height)
+
+        // FIXED: Correct dewarp approach - for each destination pixel,
+        // calculate the vertical offset based on the detected text line curvature
+        var maxDisplacement = 0f
+        var totalDisplacement = 0f
+        var sampleCount = 0
+
+        // Strength multiplier to make the effect visible
+        val strengthMultiplier = 2.0f
+
+        Log.d(TAG, "Applying vertical dewarp correction")
+        Log.d(TAG, "Correction strength: ${strengthMultiplier}x")
+
+        for (row in 0 until height) {
+            for (col in 0 until width) {
+                val idx = row * width + col
+
+                // For each pixel, get the slope at this position
+                val slope = slopeGrid.getInterpolatedSlope(col.toFloat(), row.toFloat())
+
+                // Calculate vertical offset: how far from the current row should we pull pixels?
+                // The slope tells us dy/dx, so over the width of the image, the total offset is:
+                // offset = slope * (col - centerX) where centerX is the horizontal center
+                val centerX = width / 2f
+                val horizontalDistance = col.toFloat() - centerX
+                val verticalOffset = slope * horizontalDistance * strengthMultiplier
+
+                // Source Y is the current row adjusted by the vertical offset
+                // INVERTED: Changed from minus to plus to dewarp in opposite direction
+                val sourceY = (row.toFloat() + verticalOffset).coerceIn(0f, (height - 1).toFloat())
+
+                xData[idx] = col.toFloat()
+                yData[idx] = sourceY
+
+                if (col % 100 == 0 && row % 100 == 0) {
+                    val displacement = abs(verticalOffset)
+                    maxDisplacement = maxOf(maxDisplacement, displacement)
+                    totalDisplacement += displacement
+                    sampleCount++
+                }
+            }
+        }
+
+        val avgDisplacement = if (sampleCount > 0) totalDisplacement / sampleCount else 0f
+        Log.d(TAG, "DIAGNOSTIC: Y-displacement stats:")
+        Log.d(TAG, "  Max displacement: ${String.format("%.2f", maxDisplacement)} pixels")
+        Log.d(TAG, "  Avg displacement: ${String.format("%.2f", avgDisplacement)} pixels")
+
+        if (maxDisplacement < 1.0f) {
+            Log.w(TAG, "WARNING: Maximum displacement < 1 pixel. Dewarp will be imperceptible!")
+        }
+
+        mapX.put(0, 0, xData)
+        mapY.put(0, 0, yData)
+        return mapX to mapY
+    }
+
+    class SlopeGrid(val samples: List<SlopeSample>, val width: Int, val height: Int, val gridSize: Int = 30) {
+        private val grid = FloatArray(gridSize * gridSize)
+        private val cellW = width.toFloat() / gridSize
+        private val cellH = height.toFloat() / gridSize
+
+        init {
+            for (gy in 0 until gridSize) {
+                for (gx in 0 until gridSize) {
+                    val centerX = (gx + 0.5f) * cellW
+                    val centerY = (gy + 0.5f) * cellH
+                    grid[gy * gridSize + gx] = calculateWeightedSlope(centerX, centerY)
+                }
+            }
+
+            // DIAGNOSTIC: Check grid statistics
+            val gridSlopes = grid.toList()
+            val avgGridSlope = gridSlopes.average()
+            val maxGridSlope = gridSlopes.maxOrNull() ?: 0f
+            val minGridSlope = gridSlopes.minOrNull() ?: 0f
+            Log.v(TAG, "  Grid slope range: [${String.format("%.4f", minGridSlope)}, ${String.format("%.4f", maxGridSlope)}], avg: ${String.format("%.4f", avgGridSlope)}")
+        }
+
+        private fun calculateWeightedSlope(tx: Float, ty: Float): Float {
+            var totalWeight = 0f
+            var weightedSlope = 0f
+
+            // ADJUSTED: Smaller sigma for more localized influence
+            // Was: height / 10 (~400 pixels) - too much smoothing
+            // Now: height / 20 (~200 pixels) - more responsive to local curvature
+            val sigmaSq = (height / 20f).pow(2)
+
+            for (s in samples) {
+                val distSq = (tx - s.x) * (tx - s.x) + (ty - s.y) * (ty - s.y)
+                val weight = 1f / (distSq + sigmaSq)
+                weightedSlope += s.slope * weight
+                totalWeight += weight
+            }
+            return if (totalWeight > 0) weightedSlope / totalWeight else 0f
+        }
+
+        fun getInterpolatedSlope(x: Float, y: Float): Float {
+            val gx = (x / cellW).coerceIn(0f, gridSize - 1.001f)
+            val gy = (y / cellH).coerceIn(0f, gridSize - 1.001f)
+            val ix = gx.toInt()
+            val iy = gy.toInt()
+
+            val fx = gx - ix
+            val fy = gy - iy
+
+            val v00 = grid[iy * gridSize + ix]
+            val v10 = if (ix + 1 < gridSize) grid[iy * gridSize + (ix + 1)] else v00
+            val v01 = if (iy + 1 < gridSize) grid[(iy + 1) * gridSize + ix] else v00
+            val v11 = if (ix + 1 < gridSize && iy + 1 < gridSize)
+                grid[(iy + 1) * gridSize + (ix + 1)] else v00
+
+            val v0 = v00 * (1 - fx) + v10 * fx
+            val v1 = v01 * (1 - fx) + v11 * fx
+
+            return v0 * (1 - fy) + v1 * fy
+        }
+    }
+
+    data class SlopeSample(val x: Float, val y: Float, val slope: Float)
+
+    fun buildSlopeSamples(allLines: List<List<Point>>): List<SlopeSample> {
+        val samples = mutableListOf<SlopeSample>()
+        for (line in allLines) {
+            for (i in 0 until line.size - 1) {
+                val p1 = line[i]
+                val p2 = line[i + 1]
+
+                val dx = (p2.x - p1.x).toFloat()
+                val dy = (p2.y - p1.y).toFloat()
+
+                if (dx > 0) {
+                    samples.add(SlopeSample(
+                        x = ((p1.x + p2.x) / 2).toFloat(),
+                        y = ((p1.y + p2.y) / 2).toFloat(),
+                        slope = dy / dx
+                    ))
+                }
+            }
+        }
+        Log.d(TAG, "Built ${samples.size} slope samples from ${allLines.size} lines")
+        return samples
+    }
+
     fun extractSplineControlPointsOptimized(skeleton: Mat): List<List<Point>> {
         val start = System.currentTimeMillis()
         val labeled = Mat()
         val stats = Mat()
         val centroids = Mat()
 
-        // Connected components analysis
         val ccStart = System.currentTimeMillis()
         val numLabels = Imgproc.connectedComponentsWithStats(skeleton, labeled, stats, centroids)
         val ccDuration = System.currentTimeMillis() - ccStart
@@ -245,7 +500,6 @@ class DewarpProcessor(
         val allLines = mutableListOf<List<Point>>()
         val extractStart = System.currentTimeMillis()
 
-        // Convert labeled Mat to array for faster access
         val rows = labeled.rows()
         val cols = labeled.cols()
         val labelData = IntArray(rows * cols)
@@ -257,18 +511,15 @@ class DewarpProcessor(
             val width = stats.get(i, Imgproc.CC_STAT_WIDTH)[0].toInt()
             val right = left + width - 1
 
-            // Sample at regular intervals with optimized search
             val step = 20
             var previousY = -1
 
-            // First point
             val firstY = findSkeletonYOptimized(labelData, cols, rows, i, left, previousY)
             if (firstY != -1) {
                 linePoints.add(Point(left.toDouble(), firstY.toDouble()))
                 previousY = firstY
             }
 
-            // Middle points
             for (x in (left + step) until (right - step) step step) {
                 val y = findSkeletonYOptimized(labelData, cols, rows, i, x, previousY)
                 if (y != -1) {
@@ -277,7 +528,6 @@ class DewarpProcessor(
                 }
             }
 
-            // Last point
             val lastY = findSkeletonYOptimized(labelData, cols, rows, i, right, previousY)
             if (lastY != -1) {
                 linePoints.add(Point(right.toDouble(), lastY.toDouble()))
@@ -294,12 +544,13 @@ class DewarpProcessor(
         val totalDuration = System.currentTimeMillis() - start
         Log.v(TAG, "  Extract total: ${totalDuration}ms")
 
+        labeled.release()
+        stats.release()
+        centroids.release()
+
         return allLines
     }
 
-    /**
-     * OPTIMIZED: Uses direct array access instead of Mat.get()
-     */
     private fun findSkeletonYOptimized(
         labelData: IntArray,
         cols: Int,
@@ -311,7 +562,6 @@ class DewarpProcessor(
         var bestY = -1
         var minDeltaY = Int.MAX_VALUE
 
-        // Search a 7-pixel horizontal neighborhood
         for (dx in -3..3) {
             val currX = x + dx
             if (currX < 0 || currX >= cols) continue
@@ -332,42 +582,6 @@ class DewarpProcessor(
         return bestY
     }
 
-    /**
-     * Overlays spliced lines onto a gray Mat for visual inspection.
-     */
-    fun drawSplicedLines(grayBase: Mat, splicedLines: List<List<Point>>): Mat {
-        val debugMat = Mat()
-
-        Imgproc.cvtColor(grayBase, debugMat, Imgproc.COLOR_GRAY2RGBA)
-        debugMat.convertTo(debugMat, -1, 0.4, 50.0)
-
-        val colors = listOf(
-            Scalar(255.0, 50.0, 50.0, 255.0),
-            Scalar(50.0, 255.0, 50.0, 255.0),
-            Scalar(80.0, 150.0, 255.0, 255.0),
-            Scalar(255.0, 255.0, 50.0, 255.0),
-            Scalar(255.0, 50.0, 255.0, 255.0)
-        )
-
-        splicedLines.forEachIndexed { index, points ->
-            val color = colors[index % colors.size]
-
-            for (i in 0 until points.size - 1) {
-                Imgproc.line(debugMat, points[i], points[i + 1], color, 2, Imgproc.LINE_AA)
-                Imgproc.circle(debugMat, points[i], 3, color, -1)
-            }
-
-            if (points.isNotEmpty()) {
-                Imgproc.circle(debugMat, points.last(), 3, color, -1)
-            }
-        }
-
-        return debugMat
-    }
-
-    /**
-     * Zhang-Suen Thinning Algorithm
-     */
     private fun skeletonize(input: Mat): Mat {
         val start = System.currentTimeMillis()
         val res = input.clone()
@@ -392,242 +606,10 @@ class DewarpProcessor(
         val duration = System.currentTimeMillis() - start
         Log.v(TAG, "  Skeletonize iterations: $iterations (${duration}ms)")
 
+        temp.release()
+        eroded.release()
+        res.release()
+
         return skel
-    }
-
-    private fun countNeighbors(mat: Mat, x: Int, y: Int): Int {
-        var count = 0
-        for (dy in -1..1) {
-            for (dx in -1..1) {
-                if (dx == 0 && dy == 0) continue
-                if (mat.get(y + dy, x + dx)[0] > 0) count++
-            }
-        }
-        return count
-    }
-
-    data class SpliceCandidate(
-        val leftIdx: Int,
-        val rightIdx: Int,
-        val cost: Double
-    )
-
-    fun spliceLineFragments(
-        fragments: List<List<Point>>,
-        xGapThreshold: Double = 180.0
-    ): List<List<Point>> {
-        val spliceTag = "SpliceContest"
-        val start = System.currentTimeMillis()
-        val lines = fragments.toMutableList()
-        Log.d(spliceTag, "Starting splice with ${lines.size} fragments")
-
-        var totalJoins = 0
-        var iteration = 0
-        var candidateSearchTime = 0L
-        var intersectionTestTime = 0L
-
-        while (true) {
-            iteration++
-            val iterStart = System.currentTimeMillis()
-
-            // Find candidates
-            val candStart = System.currentTimeMillis()
-            val candidates = mutableListOf<SpliceCandidate>()
-
-            for (i in 0 until lines.size) {
-                for (j in 0 until lines.size) {
-                    if (i == j) continue
-                    val lineA = lines[i]
-                    val lineB = lines[j]
-
-                    if (lineA.last().x >= lineB.first().x) continue
-
-                    val gapX = lineB.first().x - lineA.last().x
-                    if (gapX > 0 && gapX < xGapThreshold) {
-                        val cost = calculateSpliceCost(lineA, lineB, gapX)
-
-                        if (cost < 80.0) {
-                            candidates.add(SpliceCandidate(i, j, cost))
-                        }
-                    }
-                }
-            }
-            val candDuration = System.currentTimeMillis() - candStart
-            candidateSearchTime += candDuration
-
-            if (candidates.isEmpty()) {
-                Log.d(spliceTag, "No more candidates found. Splice complete.")
-                break
-            }
-
-            candidates.sortBy { it.cost }
-
-            var joinedInThisIteration = false
-            val testStart = System.currentTimeMillis()
-
-            for (best in candidates) {
-                val left = lines[best.leftIdx]
-                val right = lines[best.rightIdx]
-
-                if (doesBridgeCrossExistingLines(left, right, lines)) {
-                    Log.w(spliceTag, "REJECTED: Bridge crosses existing text line.")
-                    continue
-                }
-
-                if (isLineIntervening(left, right, lines)) {
-                    continue
-                }
-
-                val merged = left + right
-                val toRemove = listOf(left, right)
-                lines.removeAll { it in toRemove }
-                lines.add(merged)
-
-                totalJoins++
-                Log.i(spliceTag, "JOIN SUCCESS [Iter $iteration]: Cost ${"%.2f".format(best.cost)} | Gap: ${"%.1f".format(right.first().x - left.last().x)}px")
-                joinedInThisIteration = true
-                break
-            }
-
-            val testDuration = System.currentTimeMillis() - testStart
-            intersectionTestTime += testDuration
-
-            val iterDuration = System.currentTimeMillis() - iterStart
-            Log.v(spliceTag, "  Iteration $iteration: ${iterDuration}ms (${candidates.size} candidates)")
-
-            if (!joinedInThisIteration) {
-                Log.d(spliceTag, "Candidates existed but all were blocked by interventions.")
-                break
-            }
-        }
-
-        val totalDuration = System.currentTimeMillis() - start
-        Log.d(spliceTag, "Final result: ${lines.size} lines (Total joins: $totalJoins)")
-        Log.d(spliceTag, "Splice timing breakdown:")
-        Log.d(spliceTag, "  Candidate search: ${candidateSearchTime}ms")
-        Log.d(spliceTag, "  Intersection tests: ${intersectionTestTime}ms")
-        Log.d(spliceTag, "  Total splice time: ${totalDuration}ms")
-        Log.d(spliceTag, "  Iterations: $iteration")
-
-        return lines
-    }
-
-    private fun calculateSpliceCost(left: List<Point>, right: List<Point>, gap: Double): Double {
-        val yDist = Math.abs(left.last().y - right.first().y)
-
-        if (gap < 5.0) {
-            return yDist
-        }
-
-        val exitSlope = calculateExitSlope(left)
-        val entrySlope = calculateEntrySlope(right)
-        val bridgeSlope = (right.first().y - left.last().y) / gap
-
-        val projY = left.last().y + (exitSlope * gap)
-        val verticalDist = Math.abs(projY - right.first().y)
-
-        val slopeMatch = Math.abs(exitSlope - entrySlope)
-        val bridgeMatch = Math.abs(exitSlope - bridgeSlope)
-
-        return verticalDist + (slopeMatch * 40.0) + (bridgeMatch * 40.0)
-    }
-
-    private fun isLineIntervening(
-        left: List<Point>,
-        right: List<Point>,
-        allLines: List<List<Point>>
-    ): Boolean {
-        val p1 = left.last()
-        val p2 = right.first()
-
-        val xStart = p1.x
-        val xEnd = p2.x
-        val gapWidth = xEnd - xStart
-
-        if (gapWidth < 8.0) return false
-
-        val checkAreaStart = xStart + (gapWidth * 0.1)
-        val checkAreaEnd = xEnd - (gapWidth * 0.1)
-
-        val vTolerance = 7.0
-
-        for (line in allLines) {
-            if (line === left || line === right) continue
-
-            for (p in line) {
-                if (p.x > checkAreaStart && p.x < checkAreaEnd) {
-                    val dist = distanceToSegment(p, p1, p2)
-                    if (dist < vTolerance) {
-                        return true
-                    }
-                }
-            }
-        }
-        return false
-    }
-
-    private fun distanceToSegment(p: Point, a: Point, b: Point): Double {
-        val l2 = Math.pow(b.x - a.x, 2.0) + Math.pow(b.y - a.y, 2.0)
-        if (l2 == 0.0) return Math.sqrt(Math.pow(p.x - a.x, 2.0) + Math.pow(p.y - a.y, 2.0))
-
-        var t = ((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / l2
-        t = Math.max(0.0, Math.min(1.0, t))
-
-        val projX = a.x + t * (b.x - a.x)
-        val projY = a.y + t * (b.y - a.y)
-
-        return Math.sqrt(Math.pow(p.x - projX, 2.0) + Math.pow(p.y - projY, 2.0))
-    }
-
-    private fun doesBridgeCrossExistingLines(
-        left: List<Point>,
-        right: List<Point>,
-        allLines: List<List<Point>>
-    ): Boolean {
-        val bridgeA = left.last()
-        val bridgeB = right.first()
-
-        for (line in allLines) {
-            if (line === left || line === right) continue
-
-            for (i in 0 until line.size - 1) {
-                val wallA = line[i]
-                val wallB = line[i + 1]
-
-                if (doSegmentsIntersect(bridgeA, bridgeB, wallA, wallB)) {
-                    return true
-                }
-            }
-        }
-        return false
-    }
-
-    private fun doSegmentsIntersect(p1: Point, p2: Point, p3: Point, p4: Point): Boolean {
-        fun ccw(a: Point, b: Point, c: Point): Boolean {
-            return (c.y - a.y) * (b.x - a.x) > (b.y - a.y) * (c.x - a.x)
-        }
-        return ccw(p1, p3, p4) != ccw(p2, p3, p4) && ccw(p1, p2, p3) != ccw(p1, p2, p4)
-    }
-
-    private fun calculateExitSlope(points: List<Point>): Double {
-        if (points.size < 5) return 0.0
-        val sample = points.takeLast(5)
-        val dx = sample.last().x - sample.first().x
-        val dy = sample.last().y - sample.first().y
-        return if (dx != 0.0) dy / dx else 0.0
-    }
-
-    private fun calculateEntrySlope(points: List<Point>): Double {
-        if (points.size < 5) return 0.0
-
-        val sample = points.take(5)
-        val dx = sample.last().x - sample.first().x
-        val dy = sample.last().y - sample.first().y
-
-        return if (dx != 0.0) dy / dx else 0.0
-    }
-
-    private fun applyDewarp(src: Mat, mask: FloatArray): Mat {
-        return src
     }
 }
