@@ -35,17 +35,20 @@ On your dev machine (Python):
 3. Optionally enable:
    - **Float16** or **int8** quantization for mobile performance.
 
-You’ll end up with something like: `document_segmentation.tflite`.
+You’ll end up with something like: `doc_seg_yolov8n_int8.tflite`.
 
 ### 2.3 Define model I/O contract for Android
 
-- **Input**: `float32[1, H, W, 3]` normalized RGB.
-- **Output**:
-  - `float32[1, H, W, 1]` mask (probabilities)
-  - or model‑specific segmentation output (e.g., per‑pixel logits).
-
 Document the exact tensor shapes from the export logs—you’ll need them in the TFLite wrapper.
 
+TensorFlow SavedModel: starting TFLite export with onnx2tf 1.28.8...
+Saved artifact at '/content/drive/MyDrive/rereader/best_saved_model'. The following endpoints are available:
+
+* Endpoint 'serving_default'
+  inputs_0 (POSITIONAL_ONLY): TensorSpec(shape=(1, 640, 640, 3), dtype=tf.float32, name='images')
+Output Type:
+  List[TensorSpec(shape=(1, 37, 8400), dtype=tf.float32, name=None), TensorSpec(shape=(1, 160, 160, 32), dtype=tf.float32, name=None)]
+Captures:
 ---
 
 ## 3. Android dependencies and project setup
