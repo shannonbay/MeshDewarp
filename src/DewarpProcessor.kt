@@ -9,17 +9,20 @@ import org.opencv.core.Core
 import org.opencv.core.Point
 import org.opencv.core.Scalar
 import org.opencv.core.Size
+import android.util.Log
 
 class DewarpProcessor(
     private val dbNetModel: DBNetModel
 ) {
 
     companion object {
+        private const val TAG = "DewarpProcessor"
+
         init {
             if (org.opencv.android.OpenCVLoader.initDebug()) {
-                android.util.Log.i("OpenCV", "OpenCV loaded successfully")
+                Log.i("OpenCV", "OpenCV loaded successfully")
             } else {
-                android.util.Log.e("OpenCV", "OpenCV initialization failed!")
+                Log.e("OpenCV", "OpenCV initialization failed!")
             }
         }
     }
@@ -28,76 +31,287 @@ class DewarpProcessor(
      * Processes the input bitmap to flatten the page using YOLO segmentation.
      */
     fun process(original: Bitmap): Bitmap {
-        val probMask = dbNetModel.getHeatmap(original)
+        val totalStart = System.currentTimeMillis()
+        Log.d(TAG, "========== Starting Dewarp Pipeline ==========")
+        Log.d(TAG, "Input size: ${original.width}x${original.height}")
 
-        // 1. Threshold to Binary (0 or 255)
+        // Stage 1: DBNet Heatmap Generation
+        var stageStart = System.currentTimeMillis()
+        val probMask = dbNetModel.getHeatmap(original)
+        var stageDuration = System.currentTimeMillis() - stageStart
+        Log.d(TAG, "[1/8] DBNet Heatmap: ${stageDuration}ms")
+
+        // Stage 2: Thresholding to Binary
+        stageStart = System.currentTimeMillis()
         val binary = Mat()
-        // DBNet usually needs a threshold around 0.3 for clean lines
         Imgproc.threshold(probMask, binary, 0.3, 255.0, Imgproc.THRESH_BINARY)
         binary.convertTo(binary, CvType.CV_8UC1)
+        stageDuration = System.currentTimeMillis() - stageStart
+        Log.d(TAG, "[2/8] Thresholding: ${stageDuration}ms")
 
-        // 2. Skeletonize (Thinning)
+        // Stage 3: Skeletonization
+        stageStart = System.currentTimeMillis()
         val skeleton = skeletonize(binary)
+        stageDuration = System.currentTimeMillis() - stageStart
+        Log.d(TAG, "[3/8] Skeletonization: ${stageDuration}ms")
 
-        bridgeSkeletonGaps(skeleton)
+        // Stage 4: Bridge Gaps - OPTIMIZED
+        stageStart = System.currentTimeMillis()
+        bridgeSkeletonGapsOptimized(skeleton)
+        stageDuration = System.currentTimeMillis() - stageStart
+        Log.d(TAG, "[4/8] Bridge Gaps (Optimized): ${stageDuration}ms")
 
-        // This specifically "heals" horizontal breaks of up to 4 pixels
+        // Stage 5: Morphological Close
+        stageStart = System.currentTimeMillis()
         val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 1.0))
         Imgproc.morphologyEx(skeleton, skeleton, Imgproc.MORPH_CLOSE, kernel)
+        stageDuration = System.currentTimeMillis() - stageStart
+        Log.d(TAG, "[5/8] Morphological Close: ${stageDuration}ms")
 
-        val linePoints = extractSplineControlPoints(skeleton)
+        // Stage 6: Extract Control Points - OPTIMIZED
+        stageStart = System.currentTimeMillis()
+        val linePoints = extractSplineControlPointsOptimized(skeleton)
+        stageDuration = System.currentTimeMillis() - stageStart
+        Log.d(TAG, "[6/8] Extract Control Points (Optimized): ${stageDuration}ms (${linePoints.size} fragments)")
+
+        // Stage 7: Splice Fragments
+        stageStart = System.currentTimeMillis()
         val splicedLinePoints = spliceLineFragments(linePoints)
+        stageDuration = System.currentTimeMillis() - stageStart
+        Log.d(TAG, "[7/8] Splice Fragments: ${stageDuration}ms (${linePoints.size} -> ${splicedLinePoints.size} lines)")
 
+        // Stage 8: Draw Result
+        stageStart = System.currentTimeMillis()
         val splicedLines = drawSplicedLines(skeleton, splicedLinePoints)
-
-        // 3. Optional: Extract Points for Splines
-        // val splinePoints = extractSplinePoints(skeleton)
-
         val resultBitmap = createBitmap(splicedLines.cols(), splicedLines.rows())
         org.opencv.android.Utils.matToBitmap(splicedLines, resultBitmap)
+        stageDuration = System.currentTimeMillis() - stageStart
+        Log.d(TAG, "[8/8] Draw & Convert: ${stageDuration}ms")
 
         // Cleanup
         listOf(splicedLines, probMask, binary, skeleton).forEach { it.release() }
+
+        val totalDuration = System.currentTimeMillis() - totalStart
+        Log.d(TAG, "========== Pipeline Complete: ${totalDuration}ms ==========")
+
         return resultBitmap
     }
 
     /**
+     * OPTIMIZED: Uses spatial hashing to avoid O(n²) comparisons
+     */
+    fun bridgeSkeletonGapsOptimized(skeleton: Mat, maxGap: Double = 5.0) {
+        val start = System.currentTimeMillis()
+        val rows = skeleton.rows()
+        val cols = skeleton.cols()
+
+        // Spatial hash: divide image into grid cells
+        val cellSize = (maxGap * 2).toInt()
+        val gridCols = (cols + cellSize - 1) / cellSize
+
+        // HashMap of grid cells to terminal points
+        val spatialGrid = HashMap<Int, MutableList<Point>>()
+
+        fun getGridKey(x: Int, y: Int): Int {
+            val gx = x / cellSize
+            val gy = y / cellSize
+            return gy * gridCols + gx
+        }
+
+        // Find terminal pixels and add to spatial grid
+        val findStart = System.currentTimeMillis()
+        var terminalCount = 0
+
+        for (y in 1 until rows - 1) {
+            for (x in 1 until cols - 1) {
+                if (skeleton.get(y, x)[0] > 0) {
+                    if (countNeighbors(skeleton, x, y) == 1) {
+                        val pt = Point(x.toDouble(), y.toDouble())
+                        val key = getGridKey(x, y)
+                        spatialGrid.getOrPut(key) { mutableListOf() }.add(pt)
+                        terminalCount++
+                    }
+                }
+            }
+        }
+        val findDuration = System.currentTimeMillis() - findStart
+        Log.v(TAG, "  Found $terminalCount terminal points (${findDuration}ms)")
+
+        // Connect near-neighbors using spatial hash
+        val connectStart = System.currentTimeMillis()
+        var bridgeCount = 0
+
+        spatialGrid.forEach { (key, points) ->
+            // For each cell, check neighbors in 3x3 grid around it
+            val gy = key / gridCols
+            val gx = key % gridCols
+
+            for (dy in -1..1) {
+                for (dx in -1..1) {
+                    val neighborKey = (gy + dy) * gridCols + (gx + dx)
+                    val neighborPoints = spatialGrid[neighborKey] ?: continue
+
+                    // Only check pairs where we haven't already compared them
+                    val checkSameCell = (dy == 0 && dx == 0)
+
+                    for (i in points.indices) {
+                        val p1 = points[i]
+                        val startJ = if (checkSameCell) i + 1 else 0
+
+                        for (j in startJ until neighborPoints.size) {
+                            val p2 = neighborPoints[j]
+
+                            val dist = Math.sqrt(
+                                Math.pow(p1.x - p2.x, 2.0) + Math.pow(p1.y - p2.y, 2.0)
+                            )
+
+                            if (dist > 0 && dist <= maxGap) {
+                                Imgproc.line(skeleton, p1, p2, Scalar(255.0), 1)
+                                bridgeCount++
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        val connectDuration = System.currentTimeMillis() - connectStart
+        Log.v(TAG, "  Created $bridgeCount bridges (${connectDuration}ms)")
+
+        val totalDuration = System.currentTimeMillis() - start
+        Log.v(TAG, "  Bridge total: ${totalDuration}ms")
+    }
+
+    /**
+     * OPTIMIZED: Direct pixel access instead of repeated Mat.get() calls
+     */
+    fun extractSplineControlPointsOptimized(skeleton: Mat): List<List<Point>> {
+        val start = System.currentTimeMillis()
+        val labeled = Mat()
+        val stats = Mat()
+        val centroids = Mat()
+
+        // Connected components analysis
+        val ccStart = System.currentTimeMillis()
+        val numLabels = Imgproc.connectedComponentsWithStats(skeleton, labeled, stats, centroids)
+        val ccDuration = System.currentTimeMillis() - ccStart
+        Log.v(TAG, "  Connected Components: $numLabels labels (${ccDuration}ms)")
+
+        val allLines = mutableListOf<List<Point>>()
+        val extractStart = System.currentTimeMillis()
+
+        // Convert labeled Mat to array for faster access
+        val rows = labeled.rows()
+        val cols = labeled.cols()
+        val labelData = IntArray(rows * cols)
+        labeled.get(0, 0, labelData)
+
+        for (i in 1 until numLabels) {
+            val linePoints = mutableListOf<Point>()
+            val left = stats.get(i, Imgproc.CC_STAT_LEFT)[0].toInt()
+            val width = stats.get(i, Imgproc.CC_STAT_WIDTH)[0].toInt()
+            val right = left + width - 1
+
+            // Sample at regular intervals with optimized search
+            val step = 20
+            var previousY = -1
+
+            // First point
+            val firstY = findSkeletonYOptimized(labelData, cols, rows, i, left, previousY)
+            if (firstY != -1) {
+                linePoints.add(Point(left.toDouble(), firstY.toDouble()))
+                previousY = firstY
+            }
+
+            // Middle points
+            for (x in (left + step) until (right - step) step step) {
+                val y = findSkeletonYOptimized(labelData, cols, rows, i, x, previousY)
+                if (y != -1) {
+                    linePoints.add(Point(x.toDouble(), y.toDouble()))
+                    previousY = y
+                }
+            }
+
+            // Last point
+            val lastY = findSkeletonYOptimized(labelData, cols, rows, i, right, previousY)
+            if (lastY != -1) {
+                linePoints.add(Point(right.toDouble(), lastY.toDouble()))
+            }
+
+            if (linePoints.size > 4) {
+                allLines.add(linePoints)
+            }
+        }
+
+        val extractDuration = System.currentTimeMillis() - extractStart
+        Log.v(TAG, "  Point extraction: ${extractDuration}ms")
+
+        val totalDuration = System.currentTimeMillis() - start
+        Log.v(TAG, "  Extract total: ${totalDuration}ms")
+
+        return allLines
+    }
+
+    /**
+     * OPTIMIZED: Uses direct array access instead of Mat.get()
+     */
+    private fun findSkeletonYOptimized(
+        labelData: IntArray,
+        cols: Int,
+        rows: Int,
+        targetLabel: Int,
+        x: Int,
+        previousY: Int = -1
+    ): Int {
+        var bestY = -1
+        var minDeltaY = Int.MAX_VALUE
+
+        // Search a 7-pixel horizontal neighborhood
+        for (dx in -3..3) {
+            val currX = x + dx
+            if (currX < 0 || currX >= cols) continue
+
+            for (y in 0 until rows) {
+                val index = y * cols + currX
+                if (labelData[index] == targetLabel) {
+                    if (previousY == -1) return y
+
+                    val deltaY = Math.abs(y - previousY)
+                    if (deltaY < minDeltaY) {
+                        minDeltaY = deltaY
+                        bestY = y
+                    }
+                }
+            }
+        }
+        return bestY
+    }
+
+    /**
      * Overlays spliced lines onto a gray Mat for visual inspection.
-     * @param grayBase The 960x960 CV_8UC1 Mat (thresholded or skeletonized)
-     * @param splicedLines The list of point-lists from our splicing logic
-     * @return A CV_8UC4 (RGBA) Mat with color-coded lines
      */
     fun drawSplicedLines(grayBase: Mat, splicedLines: List<List<Point>>): Mat {
         val debugMat = Mat()
 
-        // 1. Convert to RGBA so we can draw in color
         Imgproc.cvtColor(grayBase, debugMat, Imgproc.COLOR_GRAY2RGBA)
-
-        // 2. Slightly dim the background to make lines stand out
-        // (Alpha 0.4 reduces contrast, Beta 50 adds a gray floor)
         debugMat.convertTo(debugMat, -1, 0.4, 50.0)
 
         val colors = listOf(
-            Scalar(255.0, 50.0, 50.0, 255.0),   // Bright Red
-            Scalar(50.0, 255.0, 50.0, 255.0),   // Bright Green
-            Scalar(80.0, 150.0, 255.0, 255.0),  // Sky Blue
-            Scalar(255.0, 255.0, 50.0, 255.0),  // Yellow
-            Scalar(255.0, 50.0, 255.0, 255.0)   // Magenta
+            Scalar(255.0, 50.0, 50.0, 255.0),
+            Scalar(50.0, 255.0, 50.0, 255.0),
+            Scalar(80.0, 150.0, 255.0, 255.0),
+            Scalar(255.0, 255.0, 50.0, 255.0),
+            Scalar(255.0, 50.0, 255.0, 255.0)
         )
 
-        // 3. Draw the paths
         splicedLines.forEachIndexed { index, points ->
             val color = colors[index % colors.size]
 
             for (i in 0 until points.size - 1) {
-                // Draw the connection
                 Imgproc.line(debugMat, points[i], points[i + 1], color, 2, Imgproc.LINE_AA)
-
-                // Draw the control point "anchor"
                 Imgproc.circle(debugMat, points[i], 3, color, -1)
             }
 
-            // Mark the final point of the line
             if (points.isNotEmpty()) {
                 Imgproc.circle(debugMat, points.last(), 3, color, -1)
             }
@@ -108,18 +322,16 @@ class DewarpProcessor(
 
     /**
      * Zhang-Suen Thinning Algorithm
-     * Reduces binary blobs to 1-pixel wide centerlines.
      */
     private fun skeletonize(input: Mat): Mat {
+        val start = System.currentTimeMillis()
         val res = input.clone()
-
-        // Iterative erosion/opening until the image stops changing
-        // This is a fast approximation of the medial axis
         val element = Imgproc.getStructuringElement(Imgproc.MORPH_CROSS, Size(3.0, 3.0))
         val skel = Mat.zeros(res.size(), res.type())
         val temp = Mat()
         val eroded = Mat()
 
+        var iterations = 0
         var done = false
         while (!done) {
             Imgproc.erode(res, eroded, element)
@@ -128,42 +340,14 @@ class DewarpProcessor(
             Core.bitwise_or(skel, temp, skel)
             eroded.copyTo(res)
 
+            iterations++
             if (Core.countNonZero(res) == 0) done = true
         }
+
+        val duration = System.currentTimeMillis() - start
+        Log.v(TAG, "  Skeletonize iterations: $iterations (${duration}ms)")
+
         return skel
-    }
-
-    fun bridgeSkeletonGaps(skeleton: Mat, maxGap: Double = 5.0) {
-        val terminalPoints = mutableListOf<Point>()
-        val rows = skeleton.rows()
-        val cols = skeleton.cols()
-
-        // 1. Find all terminal pixels (end of a line)
-        // A terminal pixel in a skeleton has exactly one 8-neighbor
-        for (y in 1 until rows - 1) {
-            for (x in 1 until cols - 1) {
-                if (skeleton.get(y, x)[0] > 0) {
-                    if (countNeighbors(skeleton, x, y) == 1) {
-                        terminalPoints.add(Point(x.toDouble(), y.toDouble()))
-                    }
-                }
-            }
-        }
-
-        // 2. Connect near-neighbors
-        for (i in 0 until terminalPoints.size) {
-            for (j in i + 1 until terminalPoints.size) {
-                val p1 = terminalPoints[i]
-                val p2 = terminalPoints[j]
-
-                val dist = Math.sqrt(Math.pow(p1.x - p2.x, 2.0) + Math.pow(p1.y - p2.y, 2.0))
-
-                if (dist > 0 && dist <= maxGap) {
-                    // Draw a 1px bridge to "heal" the skeleton
-                    Imgproc.line(skeleton, p1, p2, Scalar(255.0), 1)
-                }
-            }
-        }
     }
 
     private fun countNeighbors(mat: Mat, x: Int, y: Int): Int {
@@ -177,84 +361,6 @@ class DewarpProcessor(
         return count
     }
 
-    /**
-     * Extracts ordered control points from the skeletonized Mat.
-     * Returns a List of Lines, where each Line is a List of Points.
-     */
-    fun extractSplineControlPoints(skeleton: Mat): List<List<Point>> {
-        val labeled = Mat()
-        val stats = Mat()
-        val centroids = Mat()
-
-        // 1. Group skeleton pixels into individual text lines
-        val numLabels = Imgproc.connectedComponentsWithStats(skeleton, labeled, stats, centroids)
-        val allLines = mutableListOf<List<Point>>()
-
-        // Start from 1 (0 is background)
-        for (i in 1 until numLabels) {
-            val linePoints = mutableListOf<Point>()
-            val left = stats.get(i, Imgproc.CC_STAT_LEFT)[0].toInt()
-            val width = stats.get(i, Imgproc.CC_STAT_WIDTH)[0].toInt()
-            val right = left + width - 1 // The absolute last pixel
-
-            // 1. ALWAYS sample the very first pixel on the left
-            val firstY = findSkeletonY(skeleton, labeled, i, left)
-            if (firstY != -1) linePoints.add(Point(left.toDouble(), firstY.toDouble()))
-
-            // 2. Sample the middle at regular intervals
-            val step = 20 // Reduced step for higher density
-            for (x in (left + step) until (right - step) step step) {
-                val y = findSkeletonY(skeleton, labeled, i, x)
-                if (y != -1) linePoints.add(Point(x.toDouble(), y.toDouble()))
-            }
-
-            // 3. ALWAYS sample the very last pixel on the right
-            val lastY = findSkeletonY(skeleton, labeled, i, right)
-            if (lastY != -1) linePoints.add(Point(right.toDouble(), lastY.toDouble()))
-
-            if (linePoints.size > 4) { // Need at least 4 points for a cubic spline
-                allLines.add(linePoints)
-            }
-        }
-        return allLines
-    }
-
-    private fun findSkeletonY(
-        skeleton: Mat,
-        labels: Mat,
-        targetLabel: Int,
-        x: Int,
-        previousY: Int = -1
-    ): Int {
-        val rows = skeleton.rows()
-        val cols = skeleton.cols()
-
-        var bestY = -1
-        var minDeltaY = Int.MAX_VALUE
-
-        // Search a 7-pixel horizontal neighborhood (x-3 to x+3)
-        for (dx in -3..3) {
-            val currX = x + dx
-            if (currX < 0 || currX >= cols) continue
-
-            for (y in 0 until rows) {
-                if (labels.get(y, currX)[0].toInt() == targetLabel) {
-                    // If this is our first point in the line, any Y will do
-                    if (previousY == -1) return y
-
-                    // Otherwise, pick the Y closest to our last sampled point
-                    // to prevent "jumping" to noise or loops
-                    val deltaY = Math.abs(y - previousY)
-                    if (deltaY < minDeltaY) {
-                        minDeltaY = deltaY
-                        bestY = y
-                    }
-                }
-            }
-        }
-        return bestY
-    }
-
     data class SpliceCandidate(
         val leftIdx: Int,
         val rightIdx: Int,
@@ -265,13 +371,22 @@ class DewarpProcessor(
         fragments: List<List<Point>>,
         xGapThreshold: Double = 180.0
     ): List<List<Point>> {
-        val TAG = "SpliceContest"
+        val spliceTag = "SpliceContest"
+        val start = System.currentTimeMillis()
         val lines = fragments.toMutableList()
-        android.util.Log.d(TAG, "Starting splice with ${lines.size} fragments")
+        Log.d(spliceTag, "Starting splice with ${lines.size} fragments")
 
         var totalJoins = 0
+        var iteration = 0
+        var candidateSearchTime = 0L
+        var intersectionTestTime = 0L
 
         while (true) {
+            iteration++
+            val iterStart = System.currentTimeMillis()
+
+            // Find candidates
+            val candStart = System.currentTimeMillis()
             val candidates = mutableListOf<SpliceCandidate>()
 
             for (i in 0 until lines.size) {
@@ -286,67 +401,76 @@ class DewarpProcessor(
                     if (gapX > 0 && gapX < xGapThreshold) {
                         val cost = calculateSpliceCost(lineA, lineB, gapX)
 
-                        if (cost < 80.0) { // Slightly relaxed gate for testing
+                        if (cost < 80.0) {
                             candidates.add(SpliceCandidate(i, j, cost))
-                        } else {
-                            // Log why we didn't even consider it
-                            // android.util.Log.v(TAG, "Rejected candidate i:$i->j:$j - Cost too high: $cost")
                         }
                     }
                 }
             }
+            val candDuration = System.currentTimeMillis() - candStart
+            candidateSearchTime += candDuration
 
             if (candidates.isEmpty()) {
-                android.util.Log.d(TAG, "No more candidates found. Splice complete.")
+                Log.d(spliceTag, "No more candidates found. Splice complete.")
                 break
             }
 
             candidates.sortBy { it.cost }
 
             var joinedInThisIteration = false
+            val testStart = System.currentTimeMillis()
+
             for (best in candidates) {
                 val left = lines[best.leftIdx]
                 val right = lines[best.rightIdx]
 
-                // HARD GUARD: Does this bridge physically cross ANY other line?
                 if (doesBridgeCrossExistingLines(left, right, lines)) {
-                    android.util.Log.w("SpliceContest", "REJECTED: Bridge crosses existing text line.")
+                    Log.w(spliceTag, "REJECTED: Bridge crosses existing text line.")
                     continue
                 }
 
-                // SOFT GUARD: Is the corridor blocked? (Your previous segment-distance logic)
                 if (isLineIntervening(left, right, lines)) {
                     continue
                 }
 
-                // If it passes both, it's a safe join
                 val merged = left + right
                 val toRemove = listOf(left, right)
                 lines.removeAll { it in toRemove }
                 lines.add(merged)
 
                 totalJoins++
-                android.util.Log.i(TAG, "JOIN SUCCESS: Cost ${"%.2f".format(best.cost)} | Gap: ${"%.1f".format(right.first().x - left.last().x)}px")
+                Log.i(spliceTag, "JOIN SUCCESS [Iter $iteration]: Cost ${"%.2f".format(best.cost)} | Gap: ${"%.1f".format(right.first().x - left.last().x)}px")
                 joinedInThisIteration = true
-                break // Break to re-index and re-calculate candidates
+                break
             }
 
+            val testDuration = System.currentTimeMillis() - testStart
+            intersectionTestTime += testDuration
+
+            val iterDuration = System.currentTimeMillis() - iterStart
+            Log.v(spliceTag, "  Iteration $iteration: ${iterDuration}ms (${candidates.size} candidates)")
+
             if (!joinedInThisIteration) {
-                android.util.Log.d(TAG, "Candidates existed but all were blocked by interventions.")
+                Log.d(spliceTag, "Candidates existed but all were blocked by interventions.")
                 break
             }
         }
 
-        android.util.Log.d(TAG, "Final result: ${lines.size} lines (Total joins: $totalJoins)")
+        val totalDuration = System.currentTimeMillis() - start
+        Log.d(spliceTag, "Final result: ${lines.size} lines (Total joins: $totalJoins)")
+        Log.d(spliceTag, "Splice timing breakdown:")
+        Log.d(spliceTag, "  Candidate search: ${candidateSearchTime}ms")
+        Log.d(spliceTag, "  Intersection tests: ${intersectionTestTime}ms")
+        Log.d(spliceTag, "  Total splice time: ${totalDuration}ms")
+        Log.d(spliceTag, "  Iterations: $iteration")
+
         return lines
     }
 
     private fun calculateSpliceCost(left: List<Point>, right: List<Point>, gap: Double): Double {
         val yDist = Math.abs(left.last().y - right.first().y)
 
-        // TINY GAP CASE: If they are basically touching horizontally
         if (gap < 5.0) {
-            // Just return the vertical distance. If it's less than 10px, it's a perfect match.
             return yDist
         }
 
@@ -354,20 +478,15 @@ class DewarpProcessor(
         val entrySlope = calculateEntrySlope(right)
         val bridgeSlope = (right.first().y - left.last().y) / gap
 
-        // Standard projection error
         val projY = left.last().y + (exitSlope * gap)
         val verticalDist = Math.abs(projY - right.first().y)
 
-        // Angular error
         val slopeMatch = Math.abs(exitSlope - entrySlope)
         val bridgeMatch = Math.abs(exitSlope - bridgeSlope)
 
-        // Combine. We use a lower multiplier for bridgeMatch here
-        // because steep curves in the gutter are expected.
         return verticalDist + (slopeMatch * 40.0) + (bridgeMatch * 40.0)
     }
 
-    // Helper to ensure we aren't jumping over another line segment
     private fun isLineIntervening(
         left: List<Point>,
         right: List<Point>,
@@ -380,25 +499,21 @@ class DewarpProcessor(
         val xEnd = p2.x
         val gapWidth = xEnd - xStart
 
-        // Head-to-tail fragments don't need intervention checks
         if (gapWidth < 8.0) return false
 
-        // Shrink the horizontal check zone to ignore the immediate tips
         val checkAreaStart = xStart + (gapWidth * 0.1)
         val checkAreaEnd = xEnd - (gapWidth * 0.1)
 
-        val vTolerance = 7.0 // Allowed distance from the diagonal bridge
+        val vTolerance = 7.0
 
         for (line in allLines) {
             if (line === left || line === right) continue
 
             for (p in line) {
-                // Only check points within the horizontal span of the gap
                 if (p.x > checkAreaStart && p.x < checkAreaEnd) {
-                    // Calculate distance from point P to the segment (p1, p2)
                     val dist = distanceToSegment(p, p1, p2)
                     if (dist < vTolerance) {
-                        return true // Something is physically blocking the diagonal path
+                        return true
                     }
                 }
             }
@@ -406,14 +521,10 @@ class DewarpProcessor(
         return false
     }
 
-    /**
-     * Calculates the perpendicular distance from point P to line segment AB
-     */
     private fun distanceToSegment(p: Point, a: Point, b: Point): Double {
         val l2 = Math.pow(b.x - a.x, 2.0) + Math.pow(b.y - a.y, 2.0)
         if (l2 == 0.0) return Math.sqrt(Math.pow(p.x - a.x, 2.0) + Math.pow(p.y - a.y, 2.0))
 
-        // Projection of P onto the line segment
         var t = ((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / l2
         t = Math.max(0.0, Math.min(1.0, t))
 
@@ -432,10 +543,8 @@ class DewarpProcessor(
         val bridgeB = right.first()
 
         for (line in allLines) {
-            // Skip the two fragments we are currently joining
             if (line === left || line === right) continue
 
-            // Check every segment of every other line
             for (i in 0 until line.size - 1) {
                 val wallA = line[i]
                 val wallB = line[i + 1]
@@ -448,9 +557,6 @@ class DewarpProcessor(
         return false
     }
 
-    /**
-     * Standard CCW (Counter-Clockwise) segment intersection test
-     */
     private fun doSegmentsIntersect(p1: Point, p2: Point, p3: Point, p4: Point): Boolean {
         fun ccw(a: Point, b: Point, c: Point): Boolean {
             return (c.y - a.y) * (b.x - a.x) > (b.y - a.y) * (c.x - a.x)
@@ -460,21 +566,15 @@ class DewarpProcessor(
 
     private fun calculateExitSlope(points: List<Point>): Double {
         if (points.size < 5) return 0.0
-        // Use the last 5 points to get a stable local slope
         val sample = points.takeLast(5)
         val dx = sample.last().x - sample.first().x
         val dy = sample.last().y - sample.first().y
         return if (dx != 0.0) dy / dx else 0.0
     }
 
-    /**
-     * Calculates the trajectory of the start of a line fragment.
-     * Uses the first 5 points to determine the "entry angle".
-     */
     private fun calculateEntrySlope(points: List<Point>): Double {
         if (points.size < 5) return 0.0
 
-        // Use the first 5 points to get a stable local slope
         val sample = points.take(5)
         val dx = sample.last().x - sample.first().x
         val dy = sample.last().y - sample.first().y
@@ -483,11 +583,6 @@ class DewarpProcessor(
     }
 
     private fun applyDewarp(src: Mat, mask: FloatArray): Mat {
-        // Placeholder for the OpenCV logic:
-        // 1. Threshold the 160x160 mask to binary
-        // 2. Find external contours
-        // 3. Find 4 corners (approxPolyDP)
-        // 4. Imgproc.getPerspectiveTransform & Imgproc.warpPerspective
-        return src // Currently returns original; logic to be implemented
+        return src
     }
 }
