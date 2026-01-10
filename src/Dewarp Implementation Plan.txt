@@ -1,393 +1,74 @@
-Here’s a concrete, end‑to‑end plan to turn that dummy `DewarpProcessor` into a real DRCCBI‑style pipeline on Android using TFLite.
+STEP 1: DBNet Inference & Heatmap Generation
+- Input: Preprocess camera frame to model input size (e.g., 640x640).
+- Normalization: Apply ImageNet mean/std (crucial for DBNet accuracy).
+- Inference: Execute TFLite model to get a single-channel Probability Map.
+- Binarization: Threshold the map (prob > 0.3) to create a binary text mask.
 
----
+Creating the DBNet tflite model
 
-## 1. Overall architecture
+Invoke-WebRequest -Uri "https://paddleocr.bj.bcebos.com/PP-OCRv4/english/en_PP-OCRv4_det_infer.tar" -OutFile "en_PP-OCRv4_det_infer.tar"
+tar -xf .\ch_PP-OCRv4_det_infer.tar
 
-You’ll implement the four stages from the paper as an Android pipeline:
+python -m paddle2onnx.command --model_dir ./ch_PP-OCRv4_det_infer --model_filename inference.pdmodel --params_filename inference.pdiparams --save_file ./dbnet_det_dynamic.onnx --opset_version 11 --enable_onnx_checker True
 
-1. **YOLOv8‑seg (TFLite)**: document mask detection.
-2. **Mask post‑processing**: guided filter + Otsu threshold → binary mask.
-3. **Geometry restoration (OpenCV)**: contour, corners, sides, cubic grid.
-4. **Remapping**: displacement map + bicubic remap → dewarped bitmap.
+python -m paddle2onnx.optimize `
+     --input_model ./dbnet_det_dynamic.onnx `
+     --output_model ./dbnet_det_fixed.onnx `
+     --input_shape_dict "{'x':[1,3,640,640]}"
 
-`DewarpProcessor.process()` will orchestrate these steps synchronously or on a background thread.
+And then use this Colab to convert to tflite:
 
----
+```
+# 1. Clear old versions and install the "Golden Trio" for 2026
+!pip uninstall -y onnx onnx-graphsurgeon onnx2tf
+!pip install onnx==1.16.2  # The last version with the old mapping structure
+!pip install onnx_graphsurgeon --index-url https://pypi.ngc.nvidia.com
+!pip install -U onnx2tf simple-onnx-processing-tools tensorflow ai-edge-litert
 
-## 2. Prepare the YOLOv8 segmentation model for TFLite
+# 2. Upload your "fixed" ONNX file
+from google.colab import files
+uploaded = files.upload()
+filename = "dbnet_det_fixed.onnx"
 
-### 2.1 Get the model and weights
+# 3. Convert to TFLite (LiteRT)
+# -nuo: skips the "onnxsim" check which often triggers that 'mapping' error
+!onnx2tf -i {filename} -o output_tflite -nuo
 
-- **Clone the repo**: `https://github.com/HorizonParadox/DRCCBI`.
-- Locate the YOLOv8 segmentation training script and weights (likely YOLOv8x‑seg).
-
-### 2.2 Export YOLOv8 to TFLite
-
-On your dev machine (Python):
-
-1. **Export to ONNX or directly to TFLite** using Ultralytics’ export:
-   - `yolo export model=best.pt format=tflite` (or via ONNX → TFLite).
-2. Ensure:
-   - **Input shape**: fixed (e.g., `640x640x3`).
-   - **Output**: segmentation mask (probability map) + optional boxes.
-
-3. Optionally enable:
-   - **Float16** or **int8** quantization for mobile performance.
-
-You’ll end up with something like: `doc_seg_yolov8n_int8.tflite`.
-
-### 2.3 Define model I/O contract for Android
-
-Document the exact tensor shapes from the export logs—you’ll need them in the TFLite wrapper.
-
-TensorFlow SavedModel: starting TFLite export with onnx2tf 1.28.8...
-Saved artifact at '/content/drive/MyDrive/rereader/best_saved_model'. The following endpoints are available:
-
-* Endpoint 'serving_default'
-  inputs_0 (POSITIONAL_ONLY): TensorSpec(shape=(1, 640, 640, 3), dtype=tf.float32, name='images')
-Output Type:
-  List[TensorSpec(shape=(1, 37, 8400), dtype=tf.float32, name=None), TensorSpec(shape=(1, 160, 160, 32), dtype=tf.float32, name=None)]
-Captures:
----
-
-## 3. Android dependencies and project setup
-
-### 3.1 Add TFLite
-
-In `build.gradle` (module):
-
-```gradle
-implementation "org.tensorflow:tensorflow-lite:2.14.0"
-implementation "org.tensorflow:tensorflow-lite-support:0.4.4"
+# 4. Zip and Download
+import os
+if os.path.exists('output_tflite'):
+    !zip -r dbnet_tflite.zip output_tflite
+    files.download('dbnet_tflite.zip')
+else:
+    print("Conversion failed. Check the logs above for specific OP errors.")
 ```
 
-If you use GPU delegate later, add the GPU dependency too.
-
-### 3.2 Add OpenCV for Android
-
-- Use OpenCV Android SDK or Maven artifact:
-
-```gradle
-implementation "com.quickbirdstudios:opencv:4.5.3.0"
-```
-
-(or your preferred OpenCV binding).
-
-You’ll use OpenCV for:
-
-- contour extraction
-- corner detection
-- polynomial fitting
-- grid construction
-- remapping
-
----
-
-## 4. Implement the TFLite document mask stage
-
-### 4.1 Create a YOLOv8TFLite wrapper
-
-Create a class, e.g., `YoloSegmentationModel`:
-
-- **Fields**:
-  - `Interpreter tflite`
-  - `int inputWidth`, `inputHeight`
-  - `ByteBuffer inputBuffer`
-  - Output buffers for mask.
-
-- **Constructor**:
-  - Load `document_segmentation.tflite` from `assets`.
-  - Configure `Interpreter.Options` (threads, NNAPI/GPU if desired).
-
-- **Preprocessing**:
-  - Resize input `Bitmap` to model size.
-  - Convert to RGB.
-  - Normalize (e.g., `0–1` or `-1–1` depending on training).
-  - Fill `inputBuffer`.
-
-- **Inference**:
-  - Run `tflite.run(inputBuffer, outputMap)`.
-
-- **Postprocessing**:
-  - Extract mask tensor → `FloatArray` or `FloatArray[][]`.
-  - Resize mask back to original image size (bilinear).
-
-### 4.2 Integrate into DewarpProcessor
-
-Update `DewarpProcessor` to hold a reference:
-
-```kotlin
-class DewarpProcessor(
-    private val yoloModel: YoloSegmentationModel
-) {
-    fun process(original: Bitmap): Bitmap {
-        // 1) Run YOLOv8 segmentation
-        val probMask = yoloModel.predictMask(original)
-        // 2) Continue with CV pipeline...
-    }
-}
-```
-
----
-
-## 5. Implement mask refinement and binarization
-
-### 5.1 Guided filter (approximation)
-
-The paper uses a guided filter to refine the mask using the original image as guidance.
-
-On Android:
-
-- You can:
-  - Implement a **simple guided filter** in Kotlin/Java, or
-  - Approximate with **edge‑preserving blur** using OpenCV (e.g., `edgePreservingFilter` or bilateral filter).
-
-Minimal version:
-
-1. Convert `probMask` to OpenCV `Mat` (`CV_32F`).
-2. Apply a **small radius** bilateral filter or guided filter implementation.
-   - Radius ≈ `1%` of min dimension, as in the paper.
-
-### 5.2 Otsu threshold
-
-Use OpenCV:
-
-1. Convert refined mask to `CV_8U` grayscale (0–255).
-2. Call:
-
-```kotlin
-Imgproc.threshold(refinedMat, binaryMat, 0.0, 255.0, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU)
-```
-
-This yields `Mbinary(x, y) ∈ {0,1}`.
-
----
-
-Refinements to Step 5 (Guided Filter)
-Warning: The standard OpenCV-android SDK often omits the ximgproc module which contains the GuidedFilter.
-
-Recommendation: If you don't want to compile a custom OpenCV NDK, use the Bilateral Filter (Imgproc.bilateralFilter).
-The paper uses the Guided Filter specifically to preserve edges while smoothing the segmentation mask—a Bilateral Filter does exactly this and is available in the base Imgproc package.
-
-## 6. Contour extraction and document sides
-
-### 6.1 Extract largest contour
-
-1. `findContours` on `binaryMat`.
-2. Choose the contour with **maximum area**.
-3. Approximate contour with Douglas–Peucker:
-
-```kotlin
-Imgproc.approxPolyDP(contour, approxContour, epsilon, true)
-```
-
-Where `epsilon` is a fraction of perimeter (e.g., `0.01 * arcLength`).
-
-### 6.2 Corner detection and ordering
-
-1. Compute convex hull (`convexHull`).
-2. Extract hull points as candidate corners.
-3. Compute center of mass:
-
-```kotlin
-val center = Point(meanX, meanY)
-```
-
-4. Sort points by angle from center relative to positive Y‑axis (or X‑axis) to get consistent order (e.g., top‑left, top‑right, bottom‑right, bottom‑left).
-
-### 6.3 Segment contour into four sides
-
-Following the paper’s idea:
-
-1. Use the four corners to split the contour into four segments:
-   - `S1`: between corner1 and corner2
-   - `S2`: corner2 → corner3
-   - `S3`: corner3 → corner4
-   - `S4`: corner4 → corner1
-2. For each side `Si`, store the ordered list of points.
-
----
-
-## 7. Construct the topological 2D grid
-
-Refinements to Step 7 & 8 (Cubic Fitting & Grid)This is the "secret sauce" of the paper. Here are two technical nuances to watch for:Solving Intersections (The k-d Tree): The paper uses a k-d tree to find the intersection of horizontal and vertical cubic lines. On Android, implementing a full k-d tree might be overkill.Optimization: Since your grid is relatively small (e.g., 50x50), a Brute Force Nearest Neighbor search is often faster on mobile CPUs than the overhead of building a k-d tree for every single frame.Parametric vs. Explicit: You mentioned fitting $f(x) = ax^3 + bx^2 + cx + d$.Watch out: This fails if a side is perfectly vertical (infinite slope).Fix: Fit the lines parametrically relative to the side length $t \in [0, 1]$. Fit one polynomial for $x(t)$ and one for $y(t)$. This handles vertical and horizontal curves with the same logic
-
-### 7.1 Interpolate between opposite sides
-
-For vertical grid lines (left–right):
-
-- For each parameter `α ∈ [0,1]` (e.g., 0, 1/N, …, 1):
-  - Interpolate between corresponding points on left and right sides:
-
-\[
-L_i(\alpha) = (1 - \alpha) P_i^{left} + \alpha P_i^{right}
-\]
-
-Similarly for horizontal lines (top–bottom).
-
-Implementation:
-
-- Sample N points along each side (e.g., 50–100).
-- Use linear interpolation between matching indices.
-
-### 7.2 Smooth coordinates (Savitzky–Golay)
-
-- Implement a 1D Savitzky–Golay filter or approximate with a small polynomial smoothing over the sequence of points.
-- Apply separately to x and y sequences of each line.
-
-### 7.3 Fit cubic polynomials
-
-For each grid line:
-
-- Fit:
-
-\[
-f_i(x) = a_i x^3 + b_i x^2 + c_i x + d_i
-\]
-
-using least squares.
-
-On Android:
-
-- Use a small linear algebra routine (e.g., your own normal equations solver or a tiny matrix library) to solve for coefficients.
-- Alternatively, fit polynomials in parametric form (x(t), y(t)) with cubic splines instead of explicit `y=f(x)`—this is often easier in practice.
-
----
-
-## 8. Grid intersections and displacement map
-
-### 8.1 Compute intersections
-
-For each pair of perpendicular grid lines (one from vertical family, one from horizontal family):
-
-- Solve `f_v(t_v)` and `f_h(t_h)` intersection.
-- In practice, you can:
-  - Sample points along each curve.
-  - Use nearest‑neighbor search (k‑d tree in the paper) to find closest intersection points.
-
-On Android:
-
-- Implement a simple k‑d tree or:
-  - Use a grid of sampled points and nearest‑distance search (good enough for mobile).
-
-You end up with a 2D array `Gdistorted[i][j] = (x_ij, y_ij)`.
-
-### 8.2 Build uniform target grid
-
-Create a uniform rectangular grid `Guniform[i][j]` over the document’s width and height:
-
-- `x_uniform = i * (W / (Nx - 1))`
-- `y_uniform = j * (H / (Ny - 1))`
-
-### 8.3 Compute displacement map
-
-For each grid node:
-
-\[
-\Delta x_{ij} = x_{distorted,ij} - x_{uniform,ij}
-\]
-\[
-\Delta y_{ij} = y_{distorted,ij} - y_{uniform,ij}
-\]
-
-Then interpolate these displacements to full image resolution using cubic interpolation.
-
-Implementation:
-
-- Store displacement as two `Mat` objects (`dx`, `dy`) or a single 2‑channel `Mat`.
-
----
-
-## 9. Bicubic remapping to produce the dewarped bitmap
-
-The "Map" Size: mapX and mapY are CV_32FC1 matrices. For a standard 12MP camera photo, these maps alone will take up ~48MB each (Total 96MB).
-
-Advice:
-1. Perform all the "math" (Steps 4–8) on a downscaled version of the image (e.g., 1024px max side).
-2. Upscale the resulting displacement grid to the full resolution.
-3. Apply Imgproc.remap only once at the very end. This keeps your UI responsive and avoids OutOfMemoryError.
-
-Use OpenCV’s `remap`:
-
-1. Build `mapX` and `mapY`:
-
-```kotlin
-val mapX = Mat(height, width, CvType.CV_32F)
-val mapY = Mat(height, width, CvType.CV_32F)
-
-// For each pixel (x, y):
-// mapX[y, x] = x + dx[y, x]
-// mapY[y, x] = y + dy[y, x]
-```
-
-2. Call:
-
-```kotlin
-Imgproc.remap(
-    srcMat,
-    dstMat,
-    mapX,
-    mapY,
-    Imgproc.INTER_CUBIC,
-    Core.BORDER_CONSTANT
-)
-```
-
-3. Convert `dstMat` back to `Bitmap` and return.
-
-This corresponds to:
-
-\[
-I'(x, y) = I(x + \Delta x(x, y), y + \Delta y(x, y))
-\]
-
----
-
-## 10. Wire it all into DewarpProcessor.process()
-
-Here’s a high‑level sketch of the final `process`:
-
-```kotlin
-class DewarpProcessor(
-    private val yoloModel: YoloSegmentationModel
-) {
-
-    fun process(original: Bitmap): Bitmap {
-        // 1) Run YOLOv8 segmentation (TFLite)
-        val probMask: Bitmap = yoloModel.predictMaskBitmap(original)
-
-        // 2) Refine mask (guided / bilateral filter) + Otsu threshold
-        val binaryMaskMat = refineAndBinarizeMask(probMask)
-
-        // 3) Extract contour, corners, and sides
-        val contourData = extractContourAndSides(binaryMaskMat)
-
-        // 4) Build topological grid (cubic polynomials)
-        val gridData = buildTopologicalGrid(contourData, original.width, original.height)
-
-        // 5) Compute displacement map and remap
-        val dewarped = remapWithDisplacement(original, gridData)
-
-        return dewarped
-    }
-}
-```
-
-Each helper (`refineAndBinarizeMask`, `extractContourAndSides`, etc.) maps directly to a section of the paper.
-
----
-
-## 11. Performance and threading
-
-- Run `process()` on a **background thread** (e.g., `Dispatchers.Default` or your own executor).
-- Reuse:
-  - TFLite `Interpreter`
-  - OpenCV `Mat` buffers
-  - Temporary arrays
-- Consider:
-  - Downscaling input for geometry estimation, then applying remap at full resolution using scaled coordinates.
-
----
-
-If you’d like, next step we can zoom into one of the “hard” pieces—e.g., a concrete implementation of the contour‑to‑grid step or a minimal guided filter approximation that behaves well on mobile.
+STEP 2: Baseline Extraction (Skeletonization)
+- Contour Finding: Use Imgproc.findContours on the binary mask to get text "ribbons."
+- Filtering: Discard small contours (noise) based on area.
+- Point Sampling: For each ribbon, extract points along the top and bottom edges.
+- Medial Axis: Average the top/bottom points to find the "center-line" points of the text.
+
+STEP 3: Piecewise Cubic B-Spline Fitting
+- Knot Placement: Define "knots" at regular horizontal intervals (e.g., every 10% of width).
+- Spline Construction:
+    - Use a B-Spline library (or a Least Squares solver) to fit a cubic spline to the center-line points.
+    - Result: A continuous function S(x) that represents the "flow" of that specific text line.
+- Sharp Fold Handling: Increase knot density in areas where the derivative (slope) changes rapidly.
+
+STEP 4: Global Mesh Generation
+- Grid Sampling: Create an M x N grid of control points (e.g., 15 columns by 20 rows).
+- Vertical Alignment:
+    - For each column, calculate the "average vertical offset" from all splines passing through that x-coordinate.
+    - Adjust the y-coordinate of every grid point in that column by this offset.
+- Result: A distorted grid that perfectly mirrors the physical distortion of the paper.
+
+STEP 5: Image Rectification (Remapping)
+- Target Grid: Create a perfectly uniform rectangular grid of the same dimensions.
+- Map Creation: Use OpenCV to convert the Distorted Grid vs. Uniform Grid into 'map_x' and 'map_y' float matrices.
+- Execution: Call Imgproc.remap(src, dst, map_x, map_y, INTER_CUBIC).
+- Output: A flattened, rectified image where text lines are horizontal and parallel.
+
+STEP 6: Integration with ClauseManager
+- Feed the rectified image into Tesseract/OCR.
+- Map the word-bounding boxes back to the original image coordinates if needed for the "reading session" UI.

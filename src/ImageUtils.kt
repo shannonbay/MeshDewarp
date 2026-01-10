@@ -97,18 +97,18 @@ class ImageUtils {
                 return bitmap
             }
         }
-    }
 
-    // In ImageUtils.kt
-    fun bitmapToMat(bitmap: Bitmap): Mat {
-        val mat = Mat()
-        Utils.bitmapToMat(bitmap, mat)
-        return mat
-    }
+        // In ImageUtils.kt
+        fun bitmapToMat(bitmap: Bitmap): Mat {
+            val mat = Mat()
+            Utils.bitmapToMat(bitmap, mat)
+            return mat
+        }
 
-    fun matToBitmap(mat: Mat): Bitmap {
-        val bitmap = createBitmap(mat.cols(), mat.rows())
-        Utils.matToBitmap(mat, bitmap)
-        return bitmap
+        fun matToBitmap(mat: Mat): Bitmap {
+            val bitmap = createBitmap(mat.cols(), mat.rows())
+            Utils.matToBitmap(mat, bitmap)
+            return bitmap
+        }
     }
 }

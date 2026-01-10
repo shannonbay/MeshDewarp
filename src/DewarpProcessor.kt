@@ -1,17 +1,13 @@
 package com.github.shannonbay.rereader.util
 
 import android.graphics.Bitmap
-import androidx.core.graphics.createBitmap
-import org.opencv.android.Utils
 import org.opencv.core.CvType
 import org.opencv.core.Mat
-import org.opencv.core.MatOfPoint
-import org.opencv.core.Point
-import org.opencv.core.Scalar
 import org.opencv.imgproc.Imgproc
+import androidx.core.graphics.createBitmap
 
 class DewarpProcessor(
-    private val yoloModel: YoloSegmentationModel
+    private val dbNetModel: DBNetModel
 ) {
 
     companion object {
@@ -28,64 +24,28 @@ class DewarpProcessor(
      * Processes the input bitmap to flatten the page using YOLO segmentation.
      */
     fun process(original: Bitmap): Bitmap {
-        // 1) Run YOLOv8 segmentation to get the 160x160 probability mask
-        val probMask = yoloModel.predictMask(original)
+        // 1) Run DBNet to get the 960x960 probability map (CV_32FC1)
+        val probMask = dbNetModel.getHeatmap(original)
 
-        // 2) Convert Bitmap to OpenCV Mat
-        val srcMat = Mat()
-        Utils.bitmapToMat(original, srcMat)
+        // 2) Convert from Float (0.0-1.0) to UByte (0-255)
+        val grayMat = Mat()
+        probMask.convertTo(grayMat, CvType.CV_8UC1, 255.0)
 
-        // 3) Create a binary mask Mat from the FloatArray (160x160)
-        val maskMat = Mat(160, 160, CvType.CV_8UC1)
-        val maskData = ByteArray(160 * 160)
-        for (i in probMask.indices) {
-            // Threshold: If probability > 0.5, set to 255 (white), else 0
-            maskData[i] = if (probMask[i] > 0.5f) 255.toByte() else 0.toByte()
-        }
-        maskMat.put(0, 0, maskData)
+        // 3) OPTIONAL: Apply a color map so you can actually see the "S-curves"
+        val colorMat = Mat()
+        Imgproc.applyColorMap(grayMat, colorMat, Imgproc.COLORMAP_JET)
 
-        // 4) Find contours and draw the outline on the original image
-        drawDocumentOutline(srcMat, maskMat)
+        // 4) Convert back to Bitmap for display in rereader
+        // Ensure resultBitmap is initialized to the correct size (640x640)
+        val resultBitmap = createBitmap(colorMat.cols(), colorMat.rows())
+        org.opencv.android.Utils.matToBitmap(colorMat, resultBitmap)
 
-        // 5) Use the mask to find the document corners and dewarp
-        val dewarpedMat = applyDewarp(srcMat, probMask)
-
-        // 6) Convert back to Bitmap
-        val resultBitmap = createBitmap(dewarpedMat.cols(), dewarpedMat.rows())
-        Utils.matToBitmap(dewarpedMat, resultBitmap)
-
-        // Cleanup
-        srcMat.release()
-        maskMat.release()
-        dewarpedMat.release()
+        // Cleanup Mats to prevent memory leaks in the core loop
+        probMask.release()
+        grayMat.release()
+        colorMat.release()
 
         return resultBitmap
-    }
-
-    private fun drawDocumentOutline(srcMat: Mat, maskMat: Mat) {
-        val contours = mutableListOf<MatOfPoint>()
-        val hierarchy = Mat()
-
-        // Find contours on the 160x160 mask
-        Imgproc.findContours(maskMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-
-        // Find the largest contour (the document)
-        val largestContour = contours.maxByOrNull { Imgproc.contourArea(it) }
-
-        largestContour?.let { contour ->
-            // Scale contour points from 160x160 back to original image size
-            val scaleX = srcMat.cols().toDouble() / 160.0
-            val scaleY = srcMat.rows().toDouble() / 160.0
-
-            val scaledPoints = contour.toArray().map { point ->
-                Point(point.x * scaleX, point.y * scaleY)
-            }
-
-            val scaledContour = MatOfPoint().apply { fromArray(*scaledPoints.toTypedArray()) }
-
-            // Draw a thick neon-green outline
-            Imgproc.drawContours(srcMat, listOf(scaledContour), -1, Scalar(0.0, 255.0, 0.0, 255.0), 10)
-        }
     }
 
     private fun applyDewarp(src: Mat, mask: FloatArray): Mat {
