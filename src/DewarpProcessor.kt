@@ -98,18 +98,32 @@ class DewarpProcessor(
     }
 
     /**
-     * OPTIMIZED: Uses spatial hashing to avoid O(n²) comparisons
+     * OPTIMIZED: Uses Connected Components to find terminals + downsampling
      */
     fun bridgeSkeletonGapsOptimized(skeleton: Mat, maxGap: Double = 5.0) {
         val start = System.currentTimeMillis()
-        val rows = skeleton.rows()
-        val cols = skeleton.cols()
 
-        // Spatial hash: divide image into grid cells
-        val cellSize = (maxGap * 2).toInt()
+        // Downsample for faster terminal detection (4x smaller = 16x fewer pixels)
+        val downscaleFactor = 4.0
+        val small = Mat()
+        Imgproc.resize(skeleton, small, Size(), 1.0/downscaleFactor, 1.0/downscaleFactor, Imgproc.INTER_NEAREST)
+
+        // Run Connected Components on downsampled image
+        val labeled = Mat()
+        val stats = Mat()
+        val centroids = Mat()
+        val findStart = System.currentTimeMillis()
+        val numLabels = Imgproc.connectedComponentsWithStats(small, labeled, stats, centroids)
+
+        // Convert to array for fast access
+        val rows = labeled.rows()
+        val cols = labeled.cols()
+        val labelData = IntArray(rows * cols)
+        labeled.get(0, 0, labelData)
+
+        // Spatial hash for terminals
+        val cellSize = ((maxGap / downscaleFactor) * 2).toInt().coerceAtLeast(2)
         val gridCols = (cols + cellSize - 1) / cellSize
-
-        // HashMap of grid cells to terminal points
         val spatialGrid = HashMap<Int, MutableList<Point>>()
 
         fun getGridKey(x: Int, y: Int): Int {
@@ -118,31 +132,57 @@ class DewarpProcessor(
             return gy * gridCols + gx
         }
 
-        // Find terminal pixels and add to spatial grid
-        val findStart = System.currentTimeMillis()
+        // Find terminal points using CC-based approach
         var terminalCount = 0
+        for (label in 1 until numLabels) {
+            val componentPixels = mutableListOf<Point>()
 
-        for (y in 1 until rows - 1) {
-            for (x in 1 until cols - 1) {
-                if (skeleton.get(y, x)[0] > 0) {
-                    if (countNeighbors(skeleton, x, y) == 1) {
-                        val pt = Point(x.toDouble(), y.toDouble())
-                        val key = getGridKey(x, y)
-                        spatialGrid.getOrPut(key) { mutableListOf() }.add(pt)
-                        terminalCount++
+            // Collect all pixels in this component
+            for (y in 0 until rows) {
+                for (x in 0 until cols) {
+                    if (labelData[y * cols + x] == label) {
+                        componentPixels.add(Point(x.toDouble(), y.toDouble()))
                     }
                 }
             }
+
+            // For each pixel, check if it's a terminal (1 neighbor in same component)
+            for (p in componentPixels) {
+                val x = p.x.toInt()
+                val y = p.y.toInt()
+
+                var neighborCount = 0
+                for (dy in -1..1) {
+                    for (dx in -1..1) {
+                        if (dx == 0 && dy == 0) continue
+                        val nx = x + dx
+                        val ny = y + dy
+                        if (nx >= 0 && nx < cols && ny >= 0 && ny < rows) {
+                            if (labelData[ny * cols + nx] == label) {
+                                neighborCount++
+                            }
+                        }
+                    }
+                }
+
+                if (neighborCount == 1) {
+                    // Scale back to full resolution
+                    val fullResPoint = Point(p.x * downscaleFactor, p.y * downscaleFactor)
+                    val key = getGridKey(x, y)
+                    spatialGrid.getOrPut(key) { mutableListOf() }.add(fullResPoint)
+                    terminalCount++
+                }
+            }
         }
+
         val findDuration = System.currentTimeMillis() - findStart
-        Log.v(TAG, "  Found $terminalCount terminal points (${findDuration}ms)")
+        Log.v(TAG, "  Found $terminalCount terminal points (${findDuration}ms, downsampled ${downscaleFactor}x)")
 
         // Connect near-neighbors using spatial hash
         val connectStart = System.currentTimeMillis()
         var bridgeCount = 0
 
         spatialGrid.forEach { (key, points) ->
-            // For each cell, check neighbors in 3x3 grid around it
             val gy = key / gridCols
             val gx = key % gridCols
 
@@ -151,7 +191,6 @@ class DewarpProcessor(
                     val neighborKey = (gy + dy) * gridCols + (gx + dx)
                     val neighborPoints = spatialGrid[neighborKey] ?: continue
 
-                    // Only check pairs where we haven't already compared them
                     val checkSameCell = (dy == 0 && dx == 0)
 
                     for (i in points.indices) {
@@ -177,6 +216,12 @@ class DewarpProcessor(
 
         val connectDuration = System.currentTimeMillis() - connectStart
         Log.v(TAG, "  Created $bridgeCount bridges (${connectDuration}ms)")
+
+        // Cleanup
+        small.release()
+        labeled.release()
+        stats.release()
+        centroids.release()
 
         val totalDuration = System.currentTimeMillis() - start
         Log.v(TAG, "  Bridge total: ${totalDuration}ms")
