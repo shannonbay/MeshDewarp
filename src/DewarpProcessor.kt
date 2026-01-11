@@ -11,7 +11,6 @@ import org.opencv.core.Size
 import android.util.Log
 import kotlin.math.pow
 import kotlin.math.abs
-import androidx.core.graphics.createBitmap
 
 class DewarpProcessor(
     private val dbNetModel: DBNetModel
@@ -57,7 +56,7 @@ class DewarpProcessor(
         stageStart = System.currentTimeMillis()
         if (probMask.width() != width || probMask.height() != height) {
             Log.d(TAG, "Resizing heatmap from ${probMask.width()}x${probMask.height()} to ${width}x${height}")
-            Imgproc.resize(probMask, probMask, Size(width.toDouble(), height.toDouble()))
+            Imgproc.resize(probMask, probMask, Size(width.toDouble(), height.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)  // Use INTER_LINEAR instead of default
         }
         stageDuration = System.currentTimeMillis() - stageStart
         Log.d(TAG, "[1b/8] Heatmap Resize: ${stageDuration}ms")
@@ -170,7 +169,7 @@ class DewarpProcessor(
         Imgproc.remap(sourceMat, destinationMat, mapX, mapY, Imgproc.INTER_LINEAR)
 
         // Convert back to Bitmap
-        val resultBitmap = createBitmap(width, height)
+        val resultBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         org.opencv.android.Utils.matToBitmap(destinationMat, resultBitmap)
 
         stageDuration = System.currentTimeMillis() - stageStart
@@ -186,7 +185,8 @@ class DewarpProcessor(
     fun bridgeSkeletonGapsOptimized(skeleton: Mat, maxGap: Double = 5.0) {
         val start = System.currentTimeMillis()
 
-        val downscaleFactor = 4.0
+        // Increase downscale factor - gap bridging doesn't need full resolution
+        val downscaleFactor = 8.0  // Changed from 4.0
         val small = Mat()
         Imgproc.resize(skeleton, small, Size(), 1.0/downscaleFactor, 1.0/downscaleFactor, Imgproc.INTER_NEAREST)
 
@@ -195,8 +195,22 @@ class DewarpProcessor(
         val centroids = Mat()
         val numLabels = Imgproc.connectedComponentsWithStats(small, labeled, stats, centroids)
 
+        // Filter out tiny components early
+        val minComponentSize = 5
+        val validLabels = mutableSetOf<Int>()
+        for (label in 1 until numLabels) {
+            val area = stats.get(label, Imgproc.CC_STAT_AREA)[0].toInt()
+            if (area >= minComponentSize) {
+                validLabels.add(label)
+            }
+        }
+
+        Log.v(TAG, "  Processing ${validLabels.size} valid components (filtered from $numLabels)")
+
         val rows = labeled.rows()
         val cols = labeled.cols()
+
+        // Use direct buffer access instead of get()
         val labelData = IntArray(rows * cols)
         labeled.get(0, 0, labelData)
 
@@ -211,40 +225,44 @@ class DewarpProcessor(
         }
 
         var terminalCount = 0
-        for (label in 1 until numLabels) {
-            val componentPixels = mutableListOf<Point>()
 
-            for (y in 0 until rows) {
-                for (x in 0 until cols) {
-                    if (labelData[y * cols + x] == label) {
-                        componentPixels.add(Point(x.toDouble(), y.toDouble()))
-                    }
-                }
-            }
+        // Process only valid labels
+        for (label in validLabels) {
+            // Use bounding box to limit search area
+            val left = stats.get(label, Imgproc.CC_STAT_LEFT)[0].toInt()
+            val top = stats.get(label, Imgproc.CC_STAT_TOP)[0].toInt()
+            val width = stats.get(label, Imgproc.CC_STAT_WIDTH)[0].toInt()
+            val height = stats.get(label, Imgproc.CC_STAT_HEIGHT)[0].toInt()
 
-            for (p in componentPixels) {
-                val x = p.x.toInt()
-                val y = p.y.toInt()
+            // Only scan bounding box
+            for (y in top until (top + height).coerceAtMost(rows)) {
+                val rowStart = y * cols
+                for (x in left until (left + width).coerceAtMost(cols)) {
+                    if (labelData[rowStart + x] != label) continue
 
-                var neighborCount = 0
-                for (dy in -1..1) {
-                    for (dx in -1..1) {
-                        if (dx == 0 && dy == 0) continue
-                        val nx = x + dx
+                    var neighborCount = 0
+                    for (dy in -1..1) {
                         val ny = y + dy
-                        if (nx >= 0 && nx < cols && ny >= 0 && ny < rows) {
-                            if (labelData[ny * cols + nx] == label) {
-                                neighborCount++
+                        if (ny < 0 || ny >= rows) continue
+                        val neighborRowStart = ny * cols
+
+                        for (dx in -1..1) {
+                            if (dx == 0 && dy == 0) continue
+                            val nx = x + dx
+                            if (nx >= 0 && nx < cols) {
+                                if (labelData[neighborRowStart + nx] == label) {
+                                    neighborCount++
+                                }
                             }
                         }
                     }
-                }
 
-                if (neighborCount == 1) {
-                    val fullResPoint = Point(p.x * downscaleFactor, p.y * downscaleFactor)
-                    val key = getGridKey(x, y)
-                    spatialGrid.getOrPut(key) { mutableListOf() }.add(fullResPoint)
-                    terminalCount++
+                    if (neighborCount == 1) {
+                        val fullResPoint = Point(x * downscaleFactor, y * downscaleFactor)
+                        val key = getGridKey(x, y)
+                        spatialGrid.getOrPut(key) { mutableListOf() }.add(fullResPoint)
+                        terminalCount++
+                    }
                 }
             }
         }
@@ -252,6 +270,7 @@ class DewarpProcessor(
         Log.v(TAG, "  Found $terminalCount terminal points")
 
         var bridgeCount = 0
+        val maxGapSq = maxGap * maxGap  // Pre-compute
 
         spatialGrid.forEach { (key, points) ->
             val gy = key / gridCols
@@ -271,11 +290,11 @@ class DewarpProcessor(
                         for (j in startJ until neighborPoints.size) {
                             val p2 = neighborPoints[j]
 
-                            val dist = Math.sqrt(
-                                Math.pow(p1.x - p2.x, 2.0) + Math.pow(p1.y - p2.y, 2.0)
-                            )
+                            val dx2 = p1.x - p2.x
+                            val dy2 = p1.y - p2.y
+                            val distSq = dx2 * dx2 + dy2 * dy2
 
-                            if (dist > 0 && dist <= maxGap) {
+                            if (distSq > 0 && distSq <= maxGapSq) {
                                 Imgproc.line(skeleton, p1, p2, Scalar(255.0), 1)
                                 bridgeCount++
                             }
@@ -401,7 +420,7 @@ class DewarpProcessor(
         return mapX to mapY
     }
 
-    class SlopeGrid(val samples: List<SlopeSample>, val width: Int, val height: Int, val gridSize: Int = 30) {
+    class SlopeGrid(val samples: List<SlopeSample>, val width: Int, val height: Int, val gridSize: Int = 20) {
         private val grid = FloatArray(gridSize * gridSize)
         private val cellW = width.toFloat() / gridSize
         private val cellH = height.toFloat() / gridSize
@@ -504,33 +523,62 @@ class DewarpProcessor(
 
         val rows = labeled.rows()
         val cols = labeled.cols()
+
+        // Filter valid labels first
+        val minWidth = 50  // Skip tiny components
+        val validLabels = mutableListOf<Int>()
+        for (i in 1 until numLabels) {
+            val width = stats.get(i, Imgproc.CC_STAT_WIDTH)[0].toInt()
+            if (width >= minWidth) {
+                validLabels.add(i)
+            }
+        }
+
+        Log.v(TAG, "  Processing ${validLabels.size} valid line components")
+
+        // Pre-allocate buffer
         val labelData = IntArray(rows * cols)
         labeled.get(0, 0, labelData)
 
-        for (i in 1 until numLabels) {
+        for (i in validLabels) {
             val linePoints = mutableListOf<Point>()
             val left = stats.get(i, Imgproc.CC_STAT_LEFT)[0].toInt()
+            val top = stats.get(i, Imgproc.CC_STAT_TOP)[0].toInt()
             val width = stats.get(i, Imgproc.CC_STAT_WIDTH)[0].toInt()
+            val height = stats.get(i, Imgproc.CC_STAT_HEIGHT)[0].toInt()
             val right = left + width - 1
 
-            val step = 20
+            // Adaptive step based on component width
+            val step = (width / 10).coerceIn(10, 30)
             var previousY = -1
 
-            val firstY = findSkeletonYOptimized(labelData, cols, rows, i, left, previousY)
+            // Build column lookup table for this component only
+            val columnMap = HashMap<Int, MutableList<Int>>()
+            for (y in top until (top + height).coerceAtMost(rows)) {
+                val rowStart = y * cols
+                for (x in left until (left + width).coerceAtMost(cols)) {
+                    if (labelData[rowStart + x] == i) {
+                        columnMap.getOrPut(x) { mutableListOf() }.add(y)
+                    }
+                }
+            }
+
+            // Sample points using the lookup table
+            val firstY = findSkeletonYFast(columnMap, left, previousY)
             if (firstY != -1) {
                 linePoints.add(Point(left.toDouble(), firstY.toDouble()))
                 previousY = firstY
             }
 
             for (x in (left + step) until (right - step) step step) {
-                val y = findSkeletonYOptimized(labelData, cols, rows, i, x, previousY)
+                val y = findSkeletonYFast(columnMap, x, previousY)
                 if (y != -1) {
                     linePoints.add(Point(x.toDouble(), y.toDouble()))
                     previousY = y
                 }
             }
 
-            val lastY = findSkeletonYOptimized(labelData, cols, rows, i, right, previousY)
+            val lastY = findSkeletonYFast(columnMap, right, previousY)
             if (lastY != -1) {
                 linePoints.add(Point(right.toDouble(), lastY.toDouble()))
             }
@@ -553,35 +601,34 @@ class DewarpProcessor(
         return allLines
     }
 
-    private fun findSkeletonYOptimized(
-        labelData: IntArray,
-        cols: Int,
-        rows: Int,
-        targetLabel: Int,
+    private fun findSkeletonYFast(
+        columnMap: HashMap<Int, MutableList<Int>>,
         x: Int,
         previousY: Int = -1
     ): Int {
-        var bestY = -1
-        var minDeltaY = Int.MAX_VALUE
-
+        // Search nearby columns
         for (dx in -3..3) {
             val currX = x + dx
-            if (currX < 0 || currX >= cols) continue
+            val ysAtColumn = columnMap[currX] ?: continue
 
-            for (y in 0 until rows) {
-                val index = y * cols + currX
-                if (labelData[index] == targetLabel) {
-                    if (previousY == -1) return y
+            if (ysAtColumn.isEmpty()) continue
 
-                    val deltaY = Math.abs(y - previousY)
-                    if (deltaY < minDeltaY) {
-                        minDeltaY = deltaY
-                        bestY = y
-                    }
+            if (previousY == -1) return ysAtColumn[0]
+
+            // Find closest Y to previousY
+            var bestY = ysAtColumn[0]
+            var minDelta = Math.abs(bestY - previousY)
+
+            for (y in ysAtColumn) {
+                val delta = Math.abs(y - previousY)
+                if (delta < minDelta) {
+                    minDelta = delta
+                    bestY = y
                 }
             }
+            return bestY
         }
-        return bestY
+        return -1
     }
 
     private fun skeletonize(input: Mat): Mat {
