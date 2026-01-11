@@ -28,157 +28,75 @@ class DewarpProcessor(
         }
     }
 
+    // Add this method to DewarpProcessor class
+
     /**
-     * Processes the input bitmap to flatten the page using YOLO segmentation.
+     * Alternative dewarp using polynomial grid construction from text lines.
+     * This preserves the robustness of text-line detection while using
+     * topology-preserving polynomial grid transformation.
      */
     fun process(original: Bitmap): Bitmap {
-
         val totalStart = System.currentTimeMillis()
         val width = original.width
         val height = original.height
 
-        Log.d(TAG, "========== Starting Dewarp Pipeline ==========")
+        Log.d(TAG, "========== Starting Polynomial Grid Dewarp ==========")
         Log.d(TAG, "Input size: ${original.width}x${original.height}")
 
-        // Stage 1: DBNet Heatmap Generation
-        var stageStart = System.currentTimeMillis()
+        // Stages 1-6: Same as your existing pipeline
+        // (DBNet, threshold, skeletonize, bridge gaps, extract control points)
+
         val probMask = dbNetModel.getHeatmap(original)
-        var stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[1/8] DBNet Heatmap: ${stageDuration}ms (size: ${probMask.width()}x${probMask.height()})")
-
-        // DIAGNOSTIC: Check heatmap values
-        val heatmapStats = Core.minMaxLoc(probMask)
-        Log.d(TAG, "DIAGNOSTIC: Heatmap range [${heatmapStats.minVal}, ${heatmapStats.maxVal}]")
-        val nonZeroHeatmap = Core.countNonZero(probMask)
-        Log.d(TAG, "DIAGNOSTIC: Non-zero heatmap pixels: $nonZeroHeatmap / ${probMask.total()}")
-
-        // Normalize coordinates - resize heatmap to match original dimensions
-        stageStart = System.currentTimeMillis()
         if (probMask.width() != width || probMask.height() != height) {
-            Log.d(TAG, "Resizing heatmap from ${probMask.width()}x${probMask.height()} to ${width}x${height}")
-            Imgproc.resize(probMask, probMask, Size(width.toDouble(), height.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)  // Use INTER_LINEAR instead of default
+            Imgproc.resize(probMask, probMask, Size(width.toDouble(), height.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
         }
-        stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[1b/8] Heatmap Resize: ${stageDuration}ms")
 
-        // Stage 2: Thresholding to Binary
-        stageStart = System.currentTimeMillis()
         val binary = Mat()
         Imgproc.threshold(probMask, binary, 0.3, 255.0, Imgproc.THRESH_BINARY)
         binary.convertTo(binary, CvType.CV_8UC1)
-        stageDuration = System.currentTimeMillis() - stageStart
 
-        // DIAGNOSTIC: Check binary mask
-        val nonZeroBinary = Core.countNonZero(binary)
-        val binaryPercent = (nonZeroBinary.toFloat() / binary.total()) * 100
-        Log.d(TAG, "[2/8] Thresholding: ${stageDuration}ms")
-        Log.d(TAG, "DIAGNOSTIC: Binary pixels: $nonZeroBinary (${String.format("%.2f", binaryPercent)}% of image)")
-
-        if (nonZeroBinary == 0) {
-            Log.e(TAG, "ERROR: Binary mask is completely empty! DBNet found no text or threshold too high.")
+        if (Core.countNonZero(binary) == 0) {
             probMask.release()
             binary.release()
             return original
         }
 
-        // Stage 3: Skeletonization
-        stageStart = System.currentTimeMillis()
         val skeleton = skeletonize(binary)
-        stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[3/8] Skeletonization: ${stageDuration}ms")
-
-        val nonZeroSkeleton = Core.countNonZero(skeleton)
-        Log.d(TAG, "DIAGNOSTIC: Skeleton pixels: $nonZeroSkeleton")
-
-        // Stage 4: Bridge Gaps - OPTIMIZED
-        stageStart = System.currentTimeMillis()
         bridgeSkeletonGapsOptimized(skeleton)
-        stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[4/8] Bridge Gaps (Optimized): ${stageDuration}ms")
 
-        // Stage 5: Morphological Close
-        stageStart = System.currentTimeMillis()
         val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 1.0))
         Imgproc.morphologyEx(skeleton, skeleton, Imgproc.MORPH_CLOSE, kernel)
-        stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[5/8] Morphological Close: ${stageDuration}ms")
 
-        // Stage 6: Extract Control Points - OPTIMIZED
-        stageStart = System.currentTimeMillis()
         val linePoints = extractSplineControlPointsOptimized(skeleton)
-        stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[6/8] Extract Control Points: ${stageDuration}ms (${linePoints.size} lines)")
-
-        // DIAGNOSTIC: Show sample line points
-        if (linePoints.isNotEmpty()) {
-            val firstLine = linePoints[0]
-            Log.d(TAG, "DIAGNOSTIC: First line has ${firstLine.size} points")
-            if (firstLine.size >= 2) {
-                Log.d(TAG, "  Start: (${firstLine[0].x}, ${firstLine[0].y})")
-                Log.d(TAG, "  End: (${firstLine.last().x}, ${firstLine.last().y})")
-            }
-        }
 
         if (linePoints.isEmpty()) {
-            Log.e(TAG, "No control points found! Check DBNet output or Thresholding.")
-            Log.d(TAG, "========== Pipeline Aborted (No Data) ==========")
             probMask.release()
             binary.release()
             skeleton.release()
             return original
         }
 
-        // Stage 7: Generate Dewarp Maps (Vector Field Approach)
-        stageStart = System.currentTimeMillis()
-        val (mapX, mapY) = generateDewarpMaps(linePoints, width, height)
-        stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[7/8] Field Map Generation: ${stageDuration}ms")
+        // NEW: Use polynomial grid construction instead of slope-based field
+        val stageStart = System.currentTimeMillis()
+        val polynomialDewarp = PolynomialGridDewarp()
+        val (mapX, mapY) = polynomialDewarp.generateDewarpMaps(linePoints, width, height)
+        val stageDuration = System.currentTimeMillis() - stageStart
+        Log.d(TAG, "[7/8] Polynomial Grid Generation: ${stageDuration}ms")
 
-        // DIAGNOSTIC: Check map statistics
-        val mapYStats = Core.minMaxLoc(mapY)
-        val mapXStats = Core.minMaxLoc(mapX)
-        Log.d(TAG, "DIAGNOSTIC: MapY range [${mapYStats.minVal}, ${mapYStats.maxVal}]")
-        Log.d(TAG, "DIAGNOSTIC: MapX range [${mapXStats.minVal}, ${mapXStats.maxVal}]")
-
-        // Check for identity mapping
-        var isIdentity = true
-        val sampleSize = 100
-        for (i in 0 until sampleSize) {
-            val row = (height * i) / sampleSize
-            val col = (width * i) / sampleSize
-            val expectedY = row.toDouble()
-            val actualY = mapY.get(row, col)[0]
-            if (abs(actualY - expectedY) > 0.1) {
-                isIdentity = false
-                break
-            }
-        }
-        if (isIdentity) {
-            Log.w(TAG, "WARNING: Dewarp map appears to be identity mapping! No correction will occur.")
-        }
-
-        // Stage 8: Remap (Apply the Warp)
-        stageStart = System.currentTimeMillis()
-
-        // Convert original Bitmap to Mat
+        // Stage 8: Remap (same as before)
         val sourceMat = Mat()
         org.opencv.android.Utils.bitmapToMat(original, sourceMat)
         val destinationMat = Mat(height, width, sourceMat.type())
 
-        // Perform the actual dewarp
         Imgproc.remap(sourceMat, destinationMat, mapX, mapY, Imgproc.INTER_LINEAR)
 
-        // Convert back to Bitmap
         val resultBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         org.opencv.android.Utils.matToBitmap(destinationMat, resultBitmap)
-
-        stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[8/8] Remap & Convert: ${stageDuration}ms")
 
         // Cleanup
         listOf(sourceMat, destinationMat, mapX, mapY, probMask, binary, skeleton).forEach { it.release() }
 
-        Log.d(TAG, "========== Pipeline Complete: ${System.currentTimeMillis() - totalStart}ms ==========")
+        Log.d(TAG, "========== Polynomial Grid Pipeline Complete: ${System.currentTimeMillis() - totalStart}ms ==========")
         return resultBitmap
     }
 
