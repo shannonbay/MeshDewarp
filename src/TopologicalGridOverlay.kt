@@ -1,7 +1,6 @@
 package com.github.shannonbay.rereader.util
 
 import android.util.Log
-import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.Point
@@ -10,7 +9,6 @@ import org.opencv.imgproc.Imgproc
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
@@ -298,10 +296,54 @@ class TopologicalGridOverlay {
                 }
 
                 // Apply weighted offset, with smooth fallback to identity
+                // Apply weighted offset, with robust fallback to use extrapolated baseline data
                 val finalY = if (totalWeight > 1e-6) {
+                    // Normal local-weighted result
                     uniformY + weightedOffset / totalWeight
                 } else {
-                    uniformY
+                    // Fallback: no local influence — use extrapolated baseline data from farther away.
+                    // Compute a fallback weighted offset using all baselines' extrapolated yAtX.
+                    var fbTotalWeight = 0.0
+                    var fbWeightedOffset = 0.0
+
+                    for (baseline in baselines) {
+                        // Extrapolated baseline y at this x (yAtX already extrapolates)
+                        val baselineY = baseline.yAtX(x)
+
+                        // Horizontal distance from baseline range (0 if inside)
+                        val distX = when {
+                            x < baseline.xMin -> baseline.xMin - x
+                            x > baseline.xMax -> x - baseline.xMax
+                            else -> 0.0
+                        }
+
+                        // Use baseline width to scale decay; ensure non-zero
+                        val baselineWidth = max(1.0, baseline.xMax - baseline.xMin)
+                        val decayDistance = max(baselineWidth, params.xReliabilityScale.toDouble() * width)
+
+                        // Slow-decay weight so distant baselines still contribute
+                        val horizontalWeight = 1.0 / (1.0 + (distX / decayDistance) * (distX / decayDistance))
+
+                        // Vertical proximity still matters; keep Gaussian vertical falloff
+                        val vertDist = abs(uniformY - baselineY)
+                        val vertWeight = exp(-vertDist * vertDist / (2 * params.verticalSigma * params.verticalSigma))
+
+                        val w = horizontalWeight * vertWeight
+
+                        if (w > 1e-12) {
+                            val localOffset = baselineY - baseline.meanY
+                            fbTotalWeight += w
+                            fbWeightedOffset += w * localOffset
+                        }
+                    }
+
+                    if (fbTotalWeight > 1e-12) {
+                        // Use fallback offset (fully influenced by extrapolated baselines)
+                        uniformY + fbWeightedOffset / fbTotalWeight
+                    } else {
+                        // As a last resort (extremely unlikely), fall back to uniformY
+                        uniformY
+                    }
                 }
 
                 // Ensure y stays within image bounds
@@ -342,15 +384,11 @@ class TopologicalGridOverlay {
             x - baseline.xMax
         }
 
-        // Use a slower decay to maintain influence projection
-        // The decay distance is relative to the baseline's own width for adaptivity
-        val baselineWidth = baseline.xMax - baseline.xMin
-        val decayDistance = max(baselineWidth * 0.5, scale.toDouble() * width)
-
         // Sigmoid-like decay: maintains ~90% influence for nearby points,
         // then smoothly decays. This projects the spline influence outward.
-        return 1.0 / (1.0 + (dist / decayDistance) * (dist / decayDistance))
-    }
+        val baselineWidth = baseline.xMax - baseline.xMin
+        val decayDistance = max(baselineWidth * 1.0, scale.toDouble() * width)
+        return 1.0 / (1.0 + (dist / decayDistance) * (dist / decayDistance))    }
 
     /**
      * Verifies that the distorted grid maintains topological correctness:

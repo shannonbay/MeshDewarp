@@ -1,14 +1,12 @@
 package com.github.shannonbay.rereader.util
 
 import android.util.Log
+import org.opencv.core.Core
 import org.opencv.core.Mat
 import org.opencv.core.Point
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
-import org.opencv.core.Core
-import kotlin.math.abs
-import kotlin.math.pow
 
 object ExtractControlPointsUtil {
 
@@ -65,6 +63,7 @@ object ExtractControlPointsUtil {
      *
      * This method does not return a skeleton Mat; it returns only the extracted lines.
      */
+    @Deprecated("Use extractControlPointsPipeline instead")
     fun extractControlPointsFromCenterOfMass(binary: Mat, logTag: String = "ExtractControlPointsUtil"): List<List<Point>> {
         val start = System.currentTimeMillis()
 
@@ -333,6 +332,7 @@ object ExtractControlPointsUtil {
     }
 
     // --- Extract control points (optimized) ---
+    // --- Extract control points (optimized) ---
     private fun extractSplineControlPointsOptimized(skeleton: Mat): List<List<Point>> {
         val start = System.currentTimeMillis()
         val labeled = Mat()
@@ -420,6 +420,7 @@ object ExtractControlPointsUtil {
         return allLines
     }
 
+
     private fun findSkeletonYFast(
         columnMap: HashMap<Int, MutableList<Int>>,
         x: Int,
@@ -447,4 +448,54 @@ object ExtractControlPointsUtil {
         }
         return -1
     }
+
+    /**
+     * Adaptive sampling for a discrete baseline represented by a columnMap.
+     * Produces denser samples where curvature is high.
+     */
+    @Deprecated("Use extractControlPointsOptimized instead")
+    private fun adaptiveSampleBaseline(
+        sortedColumns: List<Int>,
+        columnMap: Map<Int, List<Int>>,
+        previousY: Int,
+        minStep: Int = 3,
+        maxStep: Int = 30,
+        curvatureWindow: Int = 5
+    ): List<Point> {
+
+        fun yAt(x: Int): Double {
+            val ys = columnMap[x]
+            return if (ys == null || ys.isEmpty()) previousY.toDouble() else ys.average()
+        }
+
+        fun curvatureAt(x: Int): Double {
+            val x0 = sortedColumns.first().coerceAtLeast(x - curvatureWindow)
+            val x2 = sortedColumns.last().coerceAtMost(x + curvatureWindow)
+            val y0 = yAt(x0)
+            val y1 = yAt(x)
+            val y2 = yAt(x2)
+            return kotlin.math.abs(y2 - 2 * y1 + y0)
+        }
+
+        val result = mutableListOf<Point>()
+        var x = sortedColumns.first()
+        var lastY = yAt(x)
+        result.add(Point(x.toDouble(), lastY))
+
+        while (x < sortedColumns.last()) {
+            val curv = curvatureAt(x)
+            val step = (maxStep / (1.0 + curv * 10.0)).toInt().coerceIn(minStep, maxStep)
+            x += step
+            if (x > sortedColumns.last()) x = sortedColumns.last()
+
+            val y = yAt(x)
+            if (kotlin.math.abs(y - lastY) > 0.1) {
+                result.add(Point(x.toDouble(), y))
+                lastY = y
+            }
+        }
+
+        return result
+    }
+
 }

@@ -8,11 +8,9 @@ import org.opencv.core.Point
  * Uses trajectory matching, projection error, and intervention checking
  * to determine which fragments should be joined.
  */
-class SplineSplicer {
+object SplineSplicer {
 
-    companion object {
-        private const val TAG = "SplineSplicer"
-    }
+    private const val TAG = "SplineSplicer"
 
     data class SpliceCandidate(
         val leftIdx: Int,
