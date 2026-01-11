@@ -11,6 +11,7 @@ import org.opencv.core.Size
 import android.util.Log
 import kotlin.math.pow
 import kotlin.math.abs
+import androidx.core.graphics.createBitmap
 
 class DewarpProcessor(
     private val dbNetModel: DBNetModel
@@ -169,7 +170,7 @@ class DewarpProcessor(
         Imgproc.remap(sourceMat, destinationMat, mapX, mapY, Imgproc.INTER_LINEAR)
 
         // Convert back to Bitmap
-        val resultBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val resultBitmap = createBitmap(width, height)
         org.opencv.android.Utils.matToBitmap(destinationMat, resultBitmap)
 
         stageDuration = System.currentTimeMillis() - stageStart
@@ -349,8 +350,9 @@ class DewarpProcessor(
         var totalDisplacement = 0f
         var sampleCount = 0
 
-        // Strength multiplier to make the effect visible
-        val strengthMultiplier = 2.0f
+        // Strength multiplier - 1.0x for exact correction, adjust if needed
+        // Was 2.0x which was overcorrecting and inverting the curve
+        val strengthMultiplier = 1.0f
 
         Log.d(TAG, "Applying vertical dewarp correction")
         Log.d(TAG, "Correction strength: ${strengthMultiplier}x")
