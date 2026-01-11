@@ -81,33 +81,14 @@ class DewarpProcessor(
             return original
         }
 
-        // Stage 3: Skeletonization
+        // Stage 3-6: Extract Control Points via Center-of-Mass (replaces skeletonization)
+        // This approach computes the vertical center-of-mass per column directly from
+        // the binary mask, which is faster and produces smoother curves than morphological
+        // skeletonization followed by gap bridging.
         stageStart = System.currentTimeMillis()
-        val skeleton = skeletonize(binary)
+        val linePoints = extractControlPointsFromCenterOfMass(binary)
         stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[3/8] Skeletonization: ${stageDuration}ms")
-
-        val nonZeroSkeleton = Core.countNonZero(skeleton)
-        Log.d(TAG, "DIAGNOSTIC: Skeleton pixels: $nonZeroSkeleton")
-
-        // Stage 4: Bridge Gaps - OPTIMIZED
-        stageStart = System.currentTimeMillis()
-        bridgeSkeletonGapsOptimized(skeleton)
-        stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[4/8] Bridge Gaps (Optimized): ${stageDuration}ms")
-
-        // Stage 5: Morphological Close
-        stageStart = System.currentTimeMillis()
-        val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 1.0))
-        Imgproc.morphologyEx(skeleton, skeleton, Imgproc.MORPH_CLOSE, kernel)
-        stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[5/8] Morphological Close: ${stageDuration}ms")
-
-        // Stage 6: Extract Control Points - OPTIMIZED
-        stageStart = System.currentTimeMillis()
-        val linePoints = extractSplineControlPointsOptimized(skeleton)
-        stageDuration = System.currentTimeMillis() - stageStart
-        Log.d(TAG, "[6/8] Extract Control Points: ${stageDuration}ms (${linePoints.size} lines)")
+        Log.d(TAG, "[3-6/8] Center-of-Mass Extraction: ${stageDuration}ms (${linePoints.size} lines)")
 
         // DIAGNOSTIC: Show sample line points
         if (linePoints.isNotEmpty()) {
@@ -124,7 +105,6 @@ class DewarpProcessor(
             Log.d(TAG, "========== Pipeline Aborted (No Data) ==========")
             probMask.release()
             binary.release()
-            skeleton.release()
             return original
         }
 
@@ -176,143 +156,10 @@ class DewarpProcessor(
         Log.d(TAG, "[8/8] Remap & Convert: ${stageDuration}ms")
 
         // Cleanup
-        listOf(sourceMat, destinationMat, mapX, mapY, probMask, binary, skeleton).forEach { it.release() }
+        listOf(sourceMat, destinationMat, mapX, mapY, probMask, binary).forEach { it.release() }
 
         Log.d(TAG, "========== Pipeline Complete: ${System.currentTimeMillis() - totalStart}ms ==========")
         return resultBitmap
-    }
-
-    fun bridgeSkeletonGapsOptimized(skeleton: Mat, maxGap: Double = 5.0) {
-        val start = System.currentTimeMillis()
-
-        // Increase downscale factor - gap bridging doesn't need full resolution
-        val downscaleFactor = 8.0  // Changed from 4.0
-        val small = Mat()
-        Imgproc.resize(skeleton, small, Size(), 1.0/downscaleFactor, 1.0/downscaleFactor, Imgproc.INTER_NEAREST)
-
-        val labeled = Mat()
-        val stats = Mat()
-        val centroids = Mat()
-        val numLabels = Imgproc.connectedComponentsWithStats(small, labeled, stats, centroids)
-
-        // Filter out tiny components early
-        val minComponentSize = 5
-        val validLabels = mutableSetOf<Int>()
-        for (label in 1 until numLabels) {
-            val area = stats.get(label, Imgproc.CC_STAT_AREA)[0].toInt()
-            if (area >= minComponentSize) {
-                validLabels.add(label)
-            }
-        }
-
-        Log.v(TAG, "  Processing ${validLabels.size} valid components (filtered from $numLabels)")
-
-        val rows = labeled.rows()
-        val cols = labeled.cols()
-
-        // Use direct buffer access instead of get()
-        val labelData = IntArray(rows * cols)
-        labeled.get(0, 0, labelData)
-
-        val cellSize = ((maxGap / downscaleFactor) * 2).toInt().coerceAtLeast(2)
-        val gridCols = (cols + cellSize - 1) / cellSize
-        val spatialGrid = HashMap<Int, MutableList<Point>>()
-
-        fun getGridKey(x: Int, y: Int): Int {
-            val gx = x / cellSize
-            val gy = y / cellSize
-            return gy * gridCols + gx
-        }
-
-        var terminalCount = 0
-
-        // Process only valid labels
-        for (label in validLabels) {
-            // Use bounding box to limit search area
-            val left = stats.get(label, Imgproc.CC_STAT_LEFT)[0].toInt()
-            val top = stats.get(label, Imgproc.CC_STAT_TOP)[0].toInt()
-            val width = stats.get(label, Imgproc.CC_STAT_WIDTH)[0].toInt()
-            val height = stats.get(label, Imgproc.CC_STAT_HEIGHT)[0].toInt()
-
-            // Only scan bounding box
-            for (y in top until (top + height).coerceAtMost(rows)) {
-                val rowStart = y * cols
-                for (x in left until (left + width).coerceAtMost(cols)) {
-                    if (labelData[rowStart + x] != label) continue
-
-                    var neighborCount = 0
-                    for (dy in -1..1) {
-                        val ny = y + dy
-                        if (ny < 0 || ny >= rows) continue
-                        val neighborRowStart = ny * cols
-
-                        for (dx in -1..1) {
-                            if (dx == 0 && dy == 0) continue
-                            val nx = x + dx
-                            if (nx >= 0 && nx < cols) {
-                                if (labelData[neighborRowStart + nx] == label) {
-                                    neighborCount++
-                                }
-                            }
-                        }
-                    }
-
-                    if (neighborCount == 1) {
-                        val fullResPoint = Point(x * downscaleFactor, y * downscaleFactor)
-                        val key = getGridKey(x, y)
-                        spatialGrid.getOrPut(key) { mutableListOf() }.add(fullResPoint)
-                        terminalCount++
-                    }
-                }
-            }
-        }
-
-        Log.v(TAG, "  Found $terminalCount terminal points")
-
-        var bridgeCount = 0
-        val maxGapSq = maxGap * maxGap  // Pre-compute
-
-        spatialGrid.forEach { (key, points) ->
-            val gy = key / gridCols
-            val gx = key % gridCols
-
-            for (dy in -1..1) {
-                for (dx in -1..1) {
-                    val neighborKey = (gy + dy) * gridCols + (gx + dx)
-                    val neighborPoints = spatialGrid[neighborKey] ?: continue
-
-                    val checkSameCell = (dy == 0 && dx == 0)
-
-                    for (i in points.indices) {
-                        val p1 = points[i]
-                        val startJ = if (checkSameCell) i + 1 else 0
-
-                        for (j in startJ until neighborPoints.size) {
-                            val p2 = neighborPoints[j]
-
-                            val dx2 = p1.x - p2.x
-                            val dy2 = p1.y - p2.y
-                            val distSq = dx2 * dx2 + dy2 * dy2
-
-                            if (distSq > 0 && distSq <= maxGapSq) {
-                                Imgproc.line(skeleton, p1, p2, Scalar(255.0), 1)
-                                bridgeCount++
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Log.v(TAG, "  Created $bridgeCount bridges")
-
-        small.release()
-        labeled.release()
-        stats.release()
-        centroids.release()
-
-        val totalDuration = System.currentTimeMillis() - start
-        Log.v(TAG, "  Bridge total: ${totalDuration}ms")
     }
 
     fun generateDewarpMaps(allLines: List<List<Point>>, width: Int, height: Int): Pair<Mat, Mat> {
@@ -507,96 +354,131 @@ class DewarpProcessor(
         return samples
     }
 
-    fun extractSplineControlPointsOptimized(skeleton: Mat): List<List<Point>> {
+    /**
+     * Extracts control points by computing the vertical center-of-mass per column
+     * directly from the binary mask. This replaces the expensive skeletonization
+     * pipeline (skeletonize -> bridge gaps -> morphological close -> extract points).
+     *
+     * For each connected component in the binary mask:
+     * 1. Find the bounding box
+     * 2. For each column within the component, compute the vertical center-of-mass
+     *    (weighted average of Y coordinates where pixels are white)
+     * 3. Sample these center-of-mass values at regular intervals as control points
+     *
+     * This approach is faster and produces smoother curves since it naturally
+     * averages across the thickness of text lines rather than trying to find
+     * a single-pixel skeleton.
+     */
+    fun extractControlPointsFromCenterOfMass(binary: Mat): List<List<Point>> {
         val start = System.currentTimeMillis()
+
+        // Find connected components
         val labeled = Mat()
         val stats = Mat()
         val centroids = Mat()
 
         val ccStart = System.currentTimeMillis()
-        val numLabels = Imgproc.connectedComponentsWithStats(skeleton, labeled, stats, centroids)
+        val numLabels = Imgproc.connectedComponentsWithStats(binary, labeled, stats, centroids)
         val ccDuration = System.currentTimeMillis() - ccStart
         Log.v(TAG, "  Connected Components: $numLabels labels (${ccDuration}ms)")
-
-        val allLines = mutableListOf<List<Point>>()
-        val extractStart = System.currentTimeMillis()
 
         val rows = labeled.rows()
         val cols = labeled.cols()
 
-        // Filter valid labels first
-        val minWidth = 50  // Skip tiny components
-        val validLabels = mutableListOf<Int>()
-        for (i in 1 until numLabels) {
-            val width = stats.get(i, Imgproc.CC_STAT_WIDTH)[0].toInt()
-            if (width >= minWidth) {
-                validLabels.add(i)
-            }
-        }
-
-        Log.v(TAG, "  Processing ${validLabels.size} valid line components")
-
-        // Pre-allocate buffer
+        // Pre-allocate buffer for efficient pixel access
         val labelData = IntArray(rows * cols)
         labeled.get(0, 0, labelData)
 
-        for (i in validLabels) {
-            val linePoints = mutableListOf<Point>()
-            val left = stats.get(i, Imgproc.CC_STAT_LEFT)[0].toInt()
-            val top = stats.get(i, Imgproc.CC_STAT_TOP)[0].toInt()
-            val width = stats.get(i, Imgproc.CC_STAT_WIDTH)[0].toInt()
-            val height = stats.get(i, Imgproc.CC_STAT_HEIGHT)[0].toInt()
-            val right = left + width - 1
+        val allLines = mutableListOf<List<Point>>()
 
-            // Adaptive step based on component width
-            val step = (width / 10).coerceIn(10, 30)
-            var previousY = -1
+        // Filter valid labels - skip tiny components
+        val minWidth = 50
+        val minHeight = 3  // Need some vertical extent to compute center-of-mass
+        val maxAspectRatio = 50.0  // Skip very thin vertical lines (likely not text)
 
-            // Build column lookup table for this component only
-            val columnMap = HashMap<Int, MutableList<Int>>()
-            for (y in top until (top + height).coerceAtMost(rows)) {
-                val rowStart = y * cols
-                for (x in left until (left + width).coerceAtMost(cols)) {
-                    if (labelData[rowStart + x] == i) {
-                        columnMap.getOrPut(x) { mutableListOf() }.add(y)
+        val validLabels = mutableListOf<Int>()
+        for (label in 1 until numLabels) {
+            val width = stats.get(label, Imgproc.CC_STAT_WIDTH)[0].toInt()
+            val height = stats.get(label, Imgproc.CC_STAT_HEIGHT)[0].toInt()
+            val aspectRatio = width.toDouble() / height.coerceAtLeast(1)
+
+            if (width >= minWidth && height >= minHeight && aspectRatio > 1.0 && aspectRatio < maxAspectRatio) {
+                validLabels.add(label)
+            }
+        }
+
+        Log.v(TAG, "  Processing ${validLabels.size} valid components (filtered from $numLabels)")
+
+        for (label in validLabels) {
+            val left = stats.get(label, Imgproc.CC_STAT_LEFT)[0].toInt()
+            val top = stats.get(label, Imgproc.CC_STAT_TOP)[0].toInt()
+            val width = stats.get(label, Imgproc.CC_STAT_WIDTH)[0].toInt()
+            val height = stats.get(label, Imgproc.CC_STAT_HEIGHT)[0].toInt()
+            val right = left + width
+
+            // Compute center-of-mass for each column within this component
+            // Store as map of column -> centerY
+            val columnCenters = mutableMapOf<Int, Double>()
+
+            for (x in left until right.coerceAtMost(cols)) {
+                var sumY = 0.0
+                var count = 0
+
+                for (y in top until (top + height).coerceAtMost(rows)) {
+                    if (labelData[y * cols + x] == label) {
+                        sumY += y
+                        count++
                     }
                 }
-            }
 
-            // Sample points using the lookup table
-            val firstY = findSkeletonYFast(columnMap, left, previousY)
-            if (firstY != -1) {
-                linePoints.add(Point(left.toDouble(), firstY.toDouble()))
-                previousY = firstY
-            }
-
-            for (x in (left + step) until (right - step) step step) {
-                val y = findSkeletonYFast(columnMap, x, previousY)
-                if (y != -1) {
-                    linePoints.add(Point(x.toDouble(), y.toDouble()))
-                    previousY = y
+                if (count > 0) {
+                    columnCenters[x] = sumY / count
                 }
             }
 
-            val lastY = findSkeletonYFast(columnMap, right, previousY)
-            if (lastY != -1) {
-                linePoints.add(Point(right.toDouble(), lastY.toDouble()))
+            if (columnCenters.isEmpty()) continue
+
+            // Sample control points at regular intervals
+            val linePoints = mutableListOf<Point>()
+
+            // Adaptive step based on component width (similar to original approach)
+            val step = (width / 10).coerceIn(10, 30)
+
+            // Get sorted columns for this component
+            val sortedColumns = columnCenters.keys.sorted()
+            if (sortedColumns.isEmpty()) continue
+
+            // Add first point
+            val firstX = sortedColumns.first()
+            linePoints.add(Point(firstX.toDouble(), columnCenters[firstX]!!))
+
+            // Add intermediate points at regular intervals
+            var lastSampledX = firstX
+            for (x in sortedColumns) {
+                if (x - lastSampledX >= step) {
+                    linePoints.add(Point(x.toDouble(), columnCenters[x]!!))
+                    lastSampledX = x
+                }
             }
 
+            // Add last point if not already added
+            val lastX = sortedColumns.last()
+            if (lastX != lastSampledX) {
+                linePoints.add(Point(lastX.toDouble(), columnCenters[lastX]!!))
+            }
+
+            // Only keep lines with enough points
             if (linePoints.size > 4) {
                 allLines.add(linePoints)
             }
         }
 
-        val extractDuration = System.currentTimeMillis() - extractStart
-        Log.v(TAG, "  Point extraction: ${extractDuration}ms")
-
-        val totalDuration = System.currentTimeMillis() - start
-        Log.v(TAG, "  Extract total: ${totalDuration}ms")
-
         labeled.release()
         stats.release()
         centroids.release()
+
+        val totalDuration = System.currentTimeMillis() - start
+        Log.v(TAG, "  Center-of-mass extraction total: ${totalDuration}ms, ${allLines.size} lines")
 
         return allLines
     }
@@ -629,36 +511,5 @@ class DewarpProcessor(
             return bestY
         }
         return -1
-    }
-
-    private fun skeletonize(input: Mat): Mat {
-        val start = System.currentTimeMillis()
-        val res = input.clone()
-        val element = Imgproc.getStructuringElement(Imgproc.MORPH_CROSS, Size(3.0, 3.0))
-        val skel = Mat.zeros(res.size(), res.type())
-        val temp = Mat()
-        val eroded = Mat()
-
-        var iterations = 0
-        var done = false
-        while (!done) {
-            Imgproc.erode(res, eroded, element)
-            Imgproc.dilate(eroded, temp, element)
-            Core.subtract(res, temp, temp)
-            Core.bitwise_or(skel, temp, skel)
-            eroded.copyTo(res)
-
-            iterations++
-            if (Core.countNonZero(res) == 0) done = true
-        }
-
-        val duration = System.currentTimeMillis() - start
-        Log.v(TAG, "  Skeletonize iterations: $iterations (${duration}ms)")
-
-        temp.release()
-        eroded.release()
-        res.release()
-
-        return skel
     }
 }
