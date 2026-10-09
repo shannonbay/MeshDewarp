@@ -1,0 +1,74 @@
+STEP 1: DBNet Inference & Heatmap Generation
+- Input: Preprocess camera frame to model input size (e.g., 640x640).
+- Normalization: Apply ImageNet mean/std (crucial for DBNet accuracy).
+- Inference: Execute TFLite model to get a single-channel Probability Map.
+- Binarization: Threshold the map (prob > 0.3) to create a binary text mask.
+
+Creating the DBNet tflite model
+
+Invoke-WebRequest -Uri "https://paddleocr.bj.bcebos.com/PP-OCRv4/english/en_PP-OCRv4_det_infer.tar" -OutFile "en_PP-OCRv4_det_infer.tar"
+tar -xf .\ch_PP-OCRv4_det_infer.tar
+
+python -m paddle2onnx.command --model_dir ./ch_PP-OCRv4_det_infer --model_filename inference.pdmodel --params_filename inference.pdiparams --save_file ./dbnet_det_dynamic.onnx --opset_version 11 --enable_onnx_checker True
+
+python -m paddle2onnx.optimize `
+     --input_model ./dbnet_det_dynamic.onnx `
+     --output_model ./dbnet_det_fixed.onnx `
+     --input_shape_dict "{'x':[1,3,640,640]}"
+
+And then use this Colab to convert to tflite:
+
+```
+# 1. Clear old versions and install the "Golden Trio" for 2026
+!pip uninstall -y onnx onnx-graphsurgeon onnx2tf
+!pip install onnx==1.16.2  # The last version with the old mapping structure
+!pip install onnx_graphsurgeon --index-url https://pypi.ngc.nvidia.com
+!pip install -U onnx2tf simple-onnx-processing-tools tensorflow ai-edge-litert
+
+# 2. Upload your "fixed" ONNX file
+from google.colab import files
+uploaded = files.upload()
+filename = "dbnet_det_fixed.onnx"
+
+# 3. Convert to TFLite (LiteRT)
+# -nuo: skips the "onnxsim" check which often triggers that 'mapping' error
+!onnx2tf -i {filename} -o output_tflite -nuo
+
+# 4. Zip and Download
+import os
+if os.path.exists('output_tflite'):
+    !zip -r dbnet_tflite.zip output_tflite
+    files.download('dbnet_tflite.zip')
+else:
+    print("Conversion failed. Check the logs above for specific OP errors.")
+```
+
+STEP 2: Baseline Extraction (Skeletonization)
+- Contour Finding: Use Imgproc.findContours on the binary mask to get text "ribbons."
+- Filtering: Discard small contours (noise) based on area.
+- Point Sampling: For each ribbon, extract points along the top and bottom edges.
+- Medial Axis: Average the top/bottom points to find the "center-line" points of the text.
+
+STEP 3: Piecewise Cubic B-Spline Fitting
+- Knot Placement: Define "knots" at regular horizontal intervals (e.g., every 10% of width).
+- Spline Construction:
+    - Use a B-Spline library (or a Least Squares solver) to fit a cubic spline to the center-line points.
+    - Result: A continuous function S(x) that represents the "flow" of that specific text line.
+- Sharp Fold Handling: Increase knot density in areas where the derivative (slope) changes rapidly.
+
+STEP 4: Global Mesh Generation
+- Grid Sampling: Create an M x N grid of control points (e.g., 15 columns by 20 rows).
+- Vertical Alignment:
+    - For each column, calculate the "average vertical offset" from all splines passing through that x-coordinate.
+    - Adjust the y-coordinate of every grid point in that column by this offset.
+- Result: A distorted grid that perfectly mirrors the physical distortion of the paper.
+
+STEP 5: Image Rectification (Remapping)
+- Target Grid: Create a perfectly uniform rectangular grid of the same dimensions.
+- Map Creation: Use OpenCV to convert the Distorted Grid vs. Uniform Grid into 'map_x' and 'map_y' float matrices.
+- Execution: Call Imgproc.remap(src, dst, map_x, map_y, INTER_CUBIC).
+- Output: A flattened, rectified image where text lines are horizontal and parallel.
+
+STEP 6: Integration with ClauseManager
+- Feed the rectified image into Tesseract/OCR.
+- Map the word-bounding boxes back to the original image coordinates if needed for the "reading session" UI.
