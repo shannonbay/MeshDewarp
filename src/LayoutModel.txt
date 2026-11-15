@@ -1,0 +1,273 @@
+# How to download and convert the paddle layout model to onnx -> tflite
+https://www.paddleocr.ai/main/en/version3.x/module_usage/layout_detection.html#ii-supported-model-list
+PP-DocLayout-L
+
+Donwload both the inference model and the training model
+
+ py -3.10 -m venv onnx2tflite
+ onnx2tflite\Scripts\activate
+  pip install onnx==1.14.1 onnx-tf==1.10.0 tensorflow==2.15.0
+   pip install tensorflow-probability==0.23.0
+
+untar the artifact with `tar -xf asdf`, put the training model inside the directory
+then run this script:
+```
+#!/usr/bin/env python3
+"""
+paddle_to_tflite_with_yaml.py
+
+Converts a Paddle inference export (inference.json + inference.pdiparams + inference.yml)
+to ONNX -> simplified ONNX -> TensorFlow SavedModel -> TFLite.
+
+This script reads preprocessing settings from inference.yml and uses them for:
+ - representative dataset preprocessing (INT8 quant)
+ - optional validation preprocessing (compare outputs)
+
+Usage:
+  python paddle_to_tflite_with_yaml.py \
+    --model-dir ./pp_doclayout_L_infer \
+    --out-dir ./out_models \
+    --onnx-opset 11 \
+    --tflite-fp16 \
+    --tflite-int8 --int8-repr ./repr_images
+
+Notes:
+ - Ensure paddle2onnx, onnxsim, onnx2tf are installed and on PATH.
+ - Ensure TensorFlow is installed in the environment used for TFLite conversion.
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import yaml
+from pathlib import Path
+
+def run(cmd, check=True):
+    print(">>>", " ".join(cmd))
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    print(proc.stdout)
+    if proc.returncode != 0:
+        print(proc.stderr, file=sys.stderr)
+        if check:
+            raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+    return proc
+
+def ensure_tools():
+    for tool in ("paddle2onnx", "onnxsim", "onnx2tf"):
+        if shutil.which(tool) is None:
+            print(f"Warning: {tool} not found in PATH. Install it before running this script.", file=sys.stderr)
+
+def load_inference_yml(model_dir, yml_name="inference.yml"):
+    p = Path(model_dir) / yml_name
+    if not p.exists():
+        raise FileNotFoundError(f"{p} not found")
+    with open(p, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    return cfg
+
+def extract_preprocess(cfg):
+    """
+    Parse the Preprocess section and return a dict with:
+      - target_size (w,h)
+      - interp (cv2 interpolation flag)
+      - keep_ratio (bool)
+      - mean (list)
+      - std (list)
+      - norm_type (string)
+      - permute (bool)
+    """
+    preprocess = cfg.get("Preprocess", [])
+    out = {
+        "target_size": (640, 640),
+        "interp": 2,  # default to cv2.INTER_CUBIC
+        "keep_ratio": False,
+        "mean": [0.0, 0.0, 0.0],
+        "std": [1.0, 1.0, 1.0],
+        "norm_type": "none",
+        "permute": True,
+    }
+    for step in preprocess:
+        t = step.get("type", "").lower()
+        if t == "resize":
+            ts = step.get("target_size")
+            if ts and len(ts) == 2:
+                out["target_size"] = (int(ts[1]), int(ts[0]))  # yaml lists [h,w] -> (w,h) for cv2
+            out["keep_ratio"] = bool(step.get("keep_ratio", False))
+            out["interp"] = int(step.get("interp", 2))
+        elif t == "normalizeimage":
+            out["mean"] = [float(x) for x in step.get("mean", out["mean"])]
+            out["std"] = [float(x) for x in step.get("std", out["std"])]
+            out["norm_type"] = step.get("norm_type", out["norm_type"])
+        elif t == "permute":
+            out["permute"] = True
+    return out
+
+def paddle_to_onnx(model_dir, model_filename, params_filename, opset, out_onnx):
+    cmd = [
+        "paddle2onnx",
+        "--model_dir", str(model_dir),
+        "--model_filename", model_filename,
+        "--params_filename", params_filename,
+        "--opset_version", str(opset),
+        "--save_file", str(out_onnx)
+    ]
+    run(cmd)
+
+def simplify_onnx(in_onnx, out_onnx):
+    cmd = ["python", "-m", "onnxsim", str(in_onnx), str(out_onnx)]
+    run(cmd)
+
+def onnx_to_savedmodel(onnx_path, out_dir):
+    cmd = ["onnx2tf", "-i", str(onnx_path), "-o", str(out_dir)]
+    run(cmd)
+
+def preprocess_image_for_model(img_path, preprocess_cfg, bgr2rgb=False):
+    """
+    Apply preprocessing exactly as in inference.yml:
+      - resize to target_size (force)
+      - optionally normalize (mean/std) depending on norm_type
+      - permute HWC->CHW
+    Returns a numpy array shaped (1, C, H, W) with dtype float32
+    """
+    import cv2
+    import numpy as np
+
+    img = cv2.imread(str(img_path))
+    if img is None:
+        raise RuntimeError(f"Failed to read {img_path}")
+    # color conversion if requested
+    if bgr2rgb:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # Resize (force to target_size since keep_ratio=false)
+    w, h = preprocess_cfg["target_size"]
+    interp_flag = {0: cv2.INTER_NEAREST, 1: cv2.INTER_LINEAR, 2: cv2.INTER_CUBIC}.get(preprocess_cfg["interp"], cv2.INTER_CUBIC)
+    img_resized = cv2.resize(img, (w, h), interpolation=interp_flag)
+
+    arr = img_resized.astype("float32")
+
+    # NormalizeImage: norm_type none means no scaling/mean subtraction per your inference.yml
+    if preprocess_cfg["norm_type"] != "none":
+        # handle common cases (e.g., mean/std in [0,1] and divide by 255)
+        mean = preprocess_cfg["mean"]
+        std = preprocess_cfg["std"]
+        arr = (arr - np.array(mean)) / np.array(std)
+
+    # Permute HWC -> CHW
+    arr = arr.transpose(2, 0, 1)  # C,H,W
+    arr = np.expand_dims(arr, axis=0)  # 1,C,H,W
+    return arr
+
+def representative_dataset_generator(repr_dir, preprocess_cfg, bgr2rgb=False, max_samples=300):
+    import numpy as np
+    from pathlib import Path
+    files = list(Path(repr_dir).glob("*"))
+    files = [f for f in files if f.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]]
+    count = 0
+    for f in files:
+        arr = preprocess_image_for_model(f, preprocess_cfg, bgr2rgb=bgr2rgb)
+        # TFLite representative generator yields a list of input arrays
+        yield [arr.astype("float32")]
+        count += 1
+        if count >= max_samples:
+            break
+
+def convert_savedmodel_to_tflite(saved_model_dir, tflite_path, fp16=False, int8=False, repr_dir=None, preprocess_cfg=None, bgr2rgb=False):
+    import tensorflow as tf
+    converter = tf.lite.TFLiteConverter.from_saved_model(str(saved_model_dir))
+    converter.experimental_new_converter = True
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+
+    if fp16:
+        converter.target_spec.supported_types = [tf.float16]
+
+    if int8:
+        if repr_dir is None or preprocess_cfg is None:
+            raise ValueError("Representative dataset directory and preprocess_cfg required for INT8 quantization")
+        gen = lambda: representative_dataset_generator(repr_dir, preprocess_cfg, bgr2rgb=bgr2rgb)
+        converter.representative_dataset = gen
+        # force full integer if desired:
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        # set input/output types to int8 if model supports it
+        converter.inference_input_type = tf.int8
+        converter.inference_output_type = tf.int8
+
+    tflite_model = converter.convert()
+    with open(tflite_path, "wb") as f:
+        f.write(tflite_model)
+    print("Wrote", tflite_path)
+
+def main():
+    parser = argparse.ArgumentParser(description="Convert Paddle inference model to TFLite (reads inference.yml)")
+    parser.add_argument("--model-dir", required=True, help="Directory with inference.json, inference.pdiparams, inference.yml")
+    parser.add_argument("--model-filename", default="inference.json", help="Paddle model filename inside model-dir")
+    parser.add_argument("--params-filename", default="inference.pdiparams", help="Paddle params filename")
+    parser.add_argument("--onnx-opset", type=int, default=11, help="ONNX opset version")
+    parser.add_argument("--out-dir", default="./out", help="Output directory")
+    parser.add_argument("--skip-simplify", action="store_true", help="Skip onnx simplifier step")
+    parser.add_argument("--tflite-fp16", action="store_true", help="Produce FP16 TFLite model")
+    parser.add_argument("--tflite-int8", action="store_true", help="Produce INT8 TFLite model (requires --int8-repr)")
+    parser.add_argument("--int8-repr", help="Directory with representative images for INT8 quantization")
+    parser.add_argument("--bgr2rgb", action="store_true", help="Convert BGR->RGB before preprocessing (set if model expects RGB)")
+    parser.add_argument("--max-repr-samples", type=int, default=300, help="Max representative samples for INT8")
+    args = parser.parse_args()
+
+    model_dir = Path(args.model_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ensure_tools()
+
+    # Load inference.yml and extract preprocessing
+    cfg = load_inference_yml(model_dir)
+    preprocess_cfg = extract_preprocess(cfg)
+    print("Preprocessing config:", preprocess_cfg)
+
+    # Step 1: paddle2onnx
+    onnx_path = out_dir / "model.onnx"
+    print("Step 1: Exporting Paddle to ONNX")
+    paddle_to_onnx(model_dir, args.model_filename, args.params_filename, args.onnx_opset, onnx_path)
+
+    # Step 2: simplify ONNX
+    simplified_onnx = out_dir / "model_simpl.onnx"
+    if args.skip_simplify:
+        simplified_onnx = onnx_path
+    else:
+        print("Step 2: Simplifying ONNX")
+        simplify_onnx(onnx_path, simplified_onnx)
+
+    # Step 3: ONNX -> SavedModel
+    saved_model_dir = out_dir / "saved_model"
+    if saved_model_dir.exists():
+        shutil.rmtree(saved_model_dir)
+    print("Step 3: Converting ONNX to TensorFlow SavedModel")
+    onnx_to_savedmodel(simplified_onnx, saved_model_dir)
+
+    # Step 4: SavedModel -> TFLite FP32
+    tflite_fp32 = out_dir / "model_fp32.tflite"
+    print("Step 4: Converting SavedModel to TFLite FP32")
+    convert_savedmodel_to_tflite(saved_model_dir, tflite_fp32, fp16=False, int8=False)
+
+    # Optional FP16
+    if args.tflite_fp16:
+        tflite_fp16 = out_dir / "model_fp16.tflite"
+        print("Step 5: Converting SavedModel to TFLite FP16")
+        convert_savedmodel_to_tflite(saved_model_dir, tflite_fp16, fp16=True, int8=False)
+
+    # Optional INT8
+    if args.tflite_int8:
+        if not args.int8_repr:
+            raise SystemExit("INT8 requested but no representative dataset provided. Use --int8-repr")
+        tflite_int8 = out_dir / "model_int8.tflite"
+        print("Step 6: Converting SavedModel to TFLite INT8")
+        # pass preprocess_cfg and bgr2rgb so representative generator matches inference.yml
+        convert_savedmodel_to_tflite(saved_model_dir, tflite_int8, fp16=False, int8=True, repr_dir=args.int8_repr, preprocess_cfg=preprocess_cfg, bgr2rgb=args.bgr2rgb)
+
+    print("All done. Outputs in", out_dir)
+
+if __name__ == "__main__":
+    main()
+
+```
