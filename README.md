@@ -7,7 +7,7 @@ Document dewarping pipeline for Android using mesh-based polynomial grid correct
 <table>
   <tr>
     <th>Before: fitted correction mesh</th>
-    <th>After: mesh straightened</th>
+    <th>After: dewarped output</th>
   </tr>
   <tr>
     <td><img src="docs/images/correction-mesh-overlay.jpg" alt="Curved book page with a red correction grid fitted to green detected text baselines" width="360"></td>
@@ -15,7 +15,7 @@ Document dewarping pipeline for Android using mesh-based polynomial grid correct
   </tr>
 </table>
 
-*Left: debug view from `TopologicalGridOverlay`, showing the detected text baselines (green splines) and the fitted correction grid (red). Right: the image after the pipeline remaps it onto the straightened grid.*
+*Left: debug view from `TopologicalGridOverlay`, showing the detected text baselines (green splines) and the fitted correction grid (red). Right: pipeline output for a separate photo of the same page, remapped onto the straightened grid (the bends along the page edge come from the dewarp). The two panels are from different source photos, not one image before and after.*
 
 ## Overview
 
