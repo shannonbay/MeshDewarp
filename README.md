@@ -4,11 +4,18 @@ Document dewarping pipeline for Android using mesh-based polynomial grid correct
 
 > **Status: prototype, not shipped.** Developed in January 2026 inside the [RecallReader](https://github.com/shannonbay/RecallReader) Android app and removed from it in October 2026 when the app went Bible-only. The source here is not a standalone build: it has no Gradle project, and the TFLite model files are not included.
 
-<p align="center">
-  <img src="docs/images/correction-mesh-overlay.jpg" alt="Photo of a curved book page with a red correction grid fitted to green detected text baselines" width="360">
-  <br>
-  <em>Debug view from <code>TopologicalGridOverlay</code>: detected text baselines (green) and the fitted correction grid (red) on a curved page.</em>
-</p>
+<table>
+  <tr>
+    <th>Before: fitted correction mesh</th>
+    <th>After: mesh straightened</th>
+  </tr>
+  <tr>
+    <td><img src="docs/images/correction-mesh-overlay.jpg" alt="Curved book page with a red correction grid fitted to green detected text baselines" width="360"></td>
+    <td><img src="docs/images/dewarped-output.jpg" alt="The same page after the mesh is straightened, with text lines running flat" width="360"></td>
+  </tr>
+</table>
+
+*Left: debug view from `TopologicalGridOverlay`, showing the detected text baselines (green splines) and the fitted correction grid (red). Right: the image after the pipeline remaps it onto the straightened grid.*
 
 ## Overview
 
